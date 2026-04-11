@@ -44,3 +44,18 @@ auth = slack_client.auth_test()
 print(f"Slack: Connected as bot ID {auth['bot_id']}")
 
 print("\n✅ All connections verified. Phase 0 complete.")
+
+# Test-5 Cerebras API
+print("\n Testing Cerebras API....")
+try:
+    from cerebras.cloud.sdk import Cerebras
+    cerebras_client = Cerebras(api_key=os.getenv("CEREBRAS_API_KEY"))
+    resp = cerebras_client.chat.completions.create(
+        model = "qwen-3-235b-a22b-instruct-2507",
+        messages = [{"role": "user", "content": "Reply with: OK"}],
+        max_tokens = 10,
+        timeout = 15,
+    )
+    print(f"✅ Cerebras: {resp.choices[0].message.content.strip()}")
+except Exception as e:
+    print(f"❌ Cerebras failed: {e}")
