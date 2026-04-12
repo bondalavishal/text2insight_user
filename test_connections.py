@@ -44,8 +44,6 @@ slack_client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
 auth = slack_client.auth_test()
 print(f"Slack: Connected as bot ID {auth['bot_id']}")
 
-print("\n✅ All connections verified. Phase 0 complete.")
-
 # Test-5 Cerebras API
 print("\n Testing Cerebras API....")
 try:
@@ -60,3 +58,7 @@ try:
     print(f"✅ Cerebras: {resp.choices[0].message.content.strip()}")
 except Exception as e:
     print(f"❌ Cerebras failed: {e}")
+
+print("\n✅ All connections verified. Phase 0 complete.")
+
+
