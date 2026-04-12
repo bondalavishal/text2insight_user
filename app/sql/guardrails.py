@@ -25,20 +25,29 @@ ALLOWED_SOURCES = [
 ]
 
 
-def validate_sql(sql: str) -> tuple[bool, str]:
+def validate_sql(sql: str) -> tuple[bool, str, str]:
+    """
+    Returns: (is_valid, reason, failure_type)
+
+    failure_type values:
+      - "ok"                 : query is valid
+      - "invalid_start"      : does not begin with SELECT or WITH
+      - "blocked_keyword"    : contains a DDL / write keyword
+      - "disallowed_source"  : references a table/view not in ALLOWED_SOURCES
+    """
     sql_upper = sql.strip().upper()
 
     if not (sql_upper.startswith("SELECT") or sql_upper.startswith("WITH")):
-        return False, "Query must start with SELECT or WITH."
+        return False, "Query must start with SELECT or WITH.", "invalid_start"
 
     for keyword in BLOCKED_KEYWORDS:
         if re.search(r'\b' + keyword + r'\b', sql_upper):
-            return False, f"Blocked keyword: {keyword}"
+            return False, f"Blocked keyword: {keyword}", "blocked_keyword"
 
     if not any(source.lower() in sql.lower() for source in ALLOWED_SOURCES):
-        return False, "Query must reference an allowed view or table."
+        return False, "Query must reference an allowed view or table.", "disallowed_source"
 
-    return True, "OK"
+    return True, "OK", "ok"
 
 
 def enforce_limit(sql: str, max_limit: int = 100) -> str:

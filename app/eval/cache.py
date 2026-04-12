@@ -67,6 +67,7 @@ def get_cached(question: str) -> dict | None:
             return {
                 "answer":     meta.get("answer", ""),
                 "sql":        meta.get("sql", ""),
+                "csv_string": meta.get("csv_string", ""),
                 "similarity": similarity,
             }
 
@@ -78,10 +79,10 @@ def get_cached(question: str) -> dict | None:
         return None
 
 
-def save_to_cache(question: str, answer: str, sql: str) -> None:
+def save_to_cache(question: str, answer: str, sql: str, csv_string: str = "") -> None:
     """
-    Save a question+answer pair to the cache.
-    Uses timestamp as unique ID so the same question can be updated.
+    Save a question+answer pair to the cache, including the CSV so that
+    cache hits can offer the user a download just like a live query would.
     """
     try:
         collection = _get_collection()
@@ -96,12 +97,31 @@ def save_to_cache(question: str, answer: str, sql: str) -> None:
         collection.add(
             ids       = [cache_id],
             documents = [question],
-            metadatas = [{"answer": answer, "sql": sql, "cached_at": str(time.time())}],
+            metadatas = [{"answer": answer, "sql": sql,
+                          "csv_string": csv_string, "cached_at": str(time.time())}],
         )
         print(f"[Cache] Saved: {question[:60]}...")
 
     except Exception as e:
         print(f"[Cache] Error during save: {e}")
+
+
+def evict_from_cache(question: str) -> bool:
+    """
+    Remove a question's cached answer from ChromaDB.
+    Called when a user signals a negative reaction so the bad answer
+    is never served again to future similar questions.
+    Returns True if the entry was found and deleted.
+    """
+    try:
+        collection = _get_collection()
+        cache_id   = f"cache_{abs(hash(question.lower().strip()))}"
+        collection.delete(ids=[cache_id])
+        print(f"[Cache] Evicted: {question[:60]}...")
+        return True
+    except Exception as e:
+        print(f"[Cache] Error during eviction: {e}")
+        return False
 
 
 def cache_stats() -> dict:

@@ -1,12 +1,14 @@
 """
-Phase 6 — Eval Logger
-Logs every question to a local CSV for pass rate analysis.
-Columns: timestamp, question, sql, rows_returned, latency_sec, cached, status, anomalies
+Phase 8 — Eval Logger (local CSV)
+Mirrors the Databricks schema so both logs stay in sync.
+
+status values : success | cache_hit | blocked | disallowed_source | failed
+interaction_type: data_query | greeting | out_of_scope | stats | download
+latency_ms    : replaces latency_sec (millisecond precision)
 """
 
 import os
 import csv
-import time
 from datetime import datetime
 
 LOG_DIR  = os.path.join(os.path.dirname(__file__))
@@ -14,14 +16,15 @@ LOG_FILE = os.path.join(LOG_DIR, "eval_log.csv")
 
 FIELDNAMES = [
     "timestamp",
+    "interaction_type",
     "question",
     "sql",
     "rows_returned",
-    "latency_sec",
+    "latency_ms",
     "cached",
-    "status",        # pass | fail | blocked | cache_hit
-    "anomalies",     # number of anomaly flags triggered
-    "error",         # error message if status=fail
+    "status",           # success | cache_hit | blocked | disallowed_source | failed
+    "anomaly_count",
+    "failure_reason",
 ]
 
 
@@ -34,30 +37,32 @@ def _ensure_file():
 
 
 def log(
-    question:     str,
-    sql:          str   = "",
-    rows_returned: int  = 0,
-    latency_sec:  float = 0.0,
-    cached:       bool  = False,
-    status:       str   = "pass",   # pass | fail | blocked | cache_hit
-    anomalies:    int   = 0,
-    error:        str   = "",
+    question:         str,
+    sql:              str   = "",
+    rows_returned:    int   = 0,
+    latency_ms:       int   = 0,
+    cached:           bool  = False,
+    status:           str   = "success",
+    anomaly_count:    int   = 0,
+    failure_reason:   str   = "",
+    interaction_type: str   = "data_query",
 ) -> None:
-    """Append one row to the eval log CSV."""
+    """Append one row to the local eval log CSV."""
     try:
         _ensure_file()
         with open(LOG_FILE, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
             writer.writerow({
-                "timestamp":     datetime.now().isoformat(),
-                "question":      question,
-                "sql":           sql.replace("\n", " "),
-                "rows_returned": rows_returned,
-                "latency_sec":   round(latency_sec, 2),
-                "cached":        cached,
-                "status":        status,
-                "anomalies":     anomalies,
-                "error":         error,
+                "timestamp":        datetime.now().isoformat(),
+                "interaction_type": interaction_type,
+                "question":         question,
+                "sql":              sql.replace("\n", " "),
+                "rows_returned":    rows_returned,
+                "latency_ms":       int(latency_ms),
+                "cached":           cached,
+                "status":           status,
+                "anomaly_count":    anomaly_count,
+                "failure_reason":   failure_reason,
             })
     except Exception as e:
         print(f"[Logger] Failed to log: {e}")
@@ -66,7 +71,7 @@ def log(
 def get_stats() -> dict:
     """
     Read the CSV and return summary stats.
-    Useful for a /stats command or periodic reporting.
+    Used by the `stats` Slack command.
     """
     try:
         _ensure_file()
@@ -78,32 +83,44 @@ def get_stats() -> dict:
         if not rows:
             return {"total": 0}
 
-        total      = len(rows)
-        passed     = sum(1 for r in rows if r["status"] == "pass")
-        failed     = sum(1 for r in rows if r["status"] == "fail")
-        blocked    = sum(1 for r in rows if r["status"] == "blocked")
-        cache_hits = sum(1 for r in rows if r["status"] == "cache_hit")
-        anomalies  = sum(int(r.get("anomalies", 0)) for r in rows)
+        # Only count data_query rows for pass/fail metrics
+        data_rows  = [r for r in rows if r.get("interaction_type") == "data_query"]
+        total      = len(data_rows)
 
-        latencies = [float(r["latency_sec"]) for r in rows
-                     if r["latency_sec"] and r["status"] != "cache_hit"]
-        avg_latency = round(sum(latencies) / len(latencies), 2) if latencies else 0
+        if total == 0:
+            return {"total": 0}
 
-        cache_latencies = [float(r["latency_sec"]) for r in rows
-                           if r["status"] == "cache_hit" and r["latency_sec"]]
-        avg_cache_latency = round(sum(cache_latencies) / len(cache_latencies), 2) if cache_latencies else 0
+        passed            = sum(1 for r in data_rows if r["status"] == "success")
+        failed            = sum(1 for r in data_rows if r["status"] == "failed")
+        blocked           = sum(1 for r in data_rows if r["status"] == "blocked")
+        disallowed        = sum(1 for r in data_rows if r["status"] == "disallowed_source")
+        cache_hits        = sum(1 for r in data_rows if r["status"] == "cache_hit")
+        anomaly_count     = sum(int(r.get("anomaly_count", 0)) for r in data_rows)
+
+        live_latencies = [
+            int(r["latency_ms"]) for r in data_rows
+            if r.get("latency_ms") and r["status"] not in ("cache_hit",)
+        ]
+        avg_latency_ms = round(sum(live_latencies) / len(live_latencies)) if live_latencies else 0
+
+        cache_latencies = [
+            int(r["latency_ms"]) for r in data_rows
+            if r["status"] == "cache_hit" and r.get("latency_ms")
+        ]
+        avg_cache_latency_ms = round(sum(cache_latencies) / len(cache_latencies)) if cache_latencies else 0
 
         return {
-            "total":              total,
-            "pass_rate":          f"{round(passed/total*100, 1)}%",
-            "passed":             passed,
-            "failed":             failed,
-            "blocked":            blocked,
-            "cache_hits":         cache_hits,
-            "cache_hit_rate":     f"{round(cache_hits/total*100, 1)}%",
-            "total_anomalies":    anomalies,
-            "avg_latency_sec":    avg_latency,
-            "avg_cache_latency":  avg_cache_latency,
+            "total":                  total,
+            "pass_rate":              f"{round(passed / total * 100, 1)}%",
+            "passed":                 passed,
+            "failed":                 failed,
+            "blocked":                blocked,
+            "disallowed_source":      disallowed,
+            "cache_hits":             cache_hits,
+            "cache_hit_rate":         f"{round(cache_hits / total * 100, 1)}%",
+            "total_anomalies":        anomaly_count,
+            "avg_latency_ms":         avg_latency_ms,
+            "avg_cache_latency_ms":   avg_cache_latency_ms,
         }
     except Exception as e:
         print(f"[Logger] Failed to get stats: {e}")
