@@ -28,6 +28,7 @@ from app.slack.handler import (
     save_to_cache,
     log,
 )
+from app.eval.cache import update_cache_log_id
 from app.eval.interaction_logger import (
     get_user_info,
     log_interaction,
@@ -37,7 +38,7 @@ from app.eval.interaction_logger import (
     csv_string_to_bytes,
     results_to_json_string,
 )
-from app.slack.feedback import classify_feedback_text
+from app.llm.spellcheck import correct_prompt
 
 load_dotenv()
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
@@ -80,6 +81,8 @@ def _answer_with_progress(
         reply="", results=[], csv_string="", result_json=None,
         status="failed", sql="", failure_reason="",
         latency_ms=0, cached=False, anomaly_count=0, rows_returned=0,
+        similarity_matched_id=None,
+        similarity_score=None,
     )
 
     # ── Cache check — instant, no progress bar ────────────────────────────────
@@ -95,6 +98,8 @@ def _answer_with_progress(
             sql=cached_entry["sql"],
             latency_ms=latency_ms,
             cached=True,
+            similarity_matched_id=cached_entry.get("similarity_matched_id"),
+            similarity_score=cached_entry.get("similarity"),
         )
         return result
 
@@ -232,21 +237,19 @@ def _handle_feedback(client, user: str, channel: str, signal: str, log_id: int, 
 # ── Core message handler ──────────────────────────────────────────────────────
 def process_message(client, user: str, text: str, channel: str):
     print(f"\n[InsightBot] User={user} Text={text}")
-    raw_prompt = text
+    raw_prompt = text  # preserve original for logging
 
-    # ── Feedback reply check (before everything else) ─────────────────────────
-    # Short replies like "yes", "wrong", "thanks" are feedback on the last answer.
+    # ── Spellcheck — correct typos/shorthand before anything else ─────────────
+    # Skip for short messages (≤ 6 words) so feedback replies like "yes" / "no"
+    # are never mangled before the feedback classifier runs.
+    spellcheck_applied = False
+    if len(text.strip().split()) > 6:
+        text = correct_prompt(text)
+        if text != raw_prompt:
+            spellcheck_applied = True
+            print(f"[InsightBot] Spellcheck applied: '{raw_prompt}' → '{text}'")
+
     last = _last_interaction.get(user)
-    if last and last.get("log_id") and last.get("question"):
-        signal = classify_feedback_text(text)
-        if signal:
-            _handle_feedback(
-                client, user, channel,
-                signal=signal,
-                log_id=last["log_id"],
-                question=last["question"],
-            )
-            return
 
     # ── Download request ──────────────────────────────────────────────────────
     if is_download_request(text):
@@ -302,12 +305,28 @@ def process_message(client, user: str, text: str, channel: str):
             raw_prompt=raw_prompt, question_asked=text,
             question_answered=stats_reply,
             status="success", interaction_type="stats",
+            spellcheck_applied=spellcheck_applied,
+            corrected_prompt=text if spellcheck_applied else None,
         )
         return
 
-    # ── Intent check ──────────────────────────────────────────────────────────
+    # ── Intent + feedback classification (single LLM call) ───────────────────
     intent = classify_intent(text)
     print(f"[InsightBot] Intent: {intent}")
+
+    # Feedback intents — only act on them if there is a prior interaction to reference
+    last = _last_interaction.get(user)
+    if intent in ("feedback_positive", "feedback_negative"):
+        if last and last.get("log_id") and last.get("question"):
+            signal = "positive" if intent == "feedback_positive" else "negative"
+            _handle_feedback(
+                client, user, channel,
+                signal=signal,
+                log_id=last["log_id"],
+                question=last["question"],
+            )
+            return
+        # No prior interaction — fall through and treat as a data question
 
     if intent == "greeting":
         greeting_reply = (
@@ -325,6 +344,8 @@ def process_message(client, user: str, text: str, channel: str):
             raw_prompt=raw_prompt, question_asked=text,
             question_answered=greeting_reply,
             status="success", interaction_type="greeting",
+            spellcheck_applied=spellcheck_applied,
+            corrected_prompt=text if spellcheck_applied else None,
         )
         return
 
@@ -342,6 +363,8 @@ def process_message(client, user: str, text: str, channel: str):
             raw_prompt=raw_prompt, question_asked=text,
             question_answered=oos_reply,
             status="success", interaction_type="out_of_scope",
+            spellcheck_applied=spellcheck_applied,
+            corrected_prompt=text if spellcheck_applied else None,
         )
         return
 
@@ -376,12 +399,18 @@ def process_message(client, user: str, text: str, channel: str):
             result_json=r["result_json"],
             generated_csv=r["csv_string"] or None,
             failure_reason=r["failure_reason"] or None,
+            similarity_matched_id=r["similarity_matched_id"],
+            similarity_score=r["similarity_score"],
             self_learned=r["status"] == "success",
             latency_ms=r["latency_ms"],
             rows_returned=r["rows_returned"],
             anomaly_count=r["anomaly_count"],
             cached=r["cached"],
+            spellcheck_applied=spellcheck_applied,
+            corrected_prompt=text if spellcheck_applied else None,
         )
+        if r["status"] == "success" and log_id:
+            update_cache_log_id(questions[0], log_id)
 
         _last_interaction[user] = {
             "results":    r["results"],
@@ -433,6 +462,7 @@ def process_message(client, user: str, text: str, channel: str):
                     failure_reason="timeout",
                     latency_ms=90000, cached=False,
                     anomaly_count=0, rows_returned=0,
+                    similarity_matched_id=None,
                 )
             except Exception as e:
                 r = dict(
@@ -442,6 +472,7 @@ def process_message(client, user: str, text: str, channel: str):
                     failure_reason=str(e),
                     latency_ms=0, cached=False,
                     anomaly_count=0, rows_returned=0,
+                    similarity_matched_id=None,
                 )
 
             parts.append(r["reply"])
@@ -457,12 +488,18 @@ def process_message(client, user: str, text: str, channel: str):
                 result_json=r["result_json"],
                 generated_csv=r["csv_string"] or None,
                 failure_reason=r["failure_reason"] or None,
+                similarity_matched_id=r["similarity_matched_id"],
+            similarity_score=r["similarity_score"],
                 self_learned=r["status"] == "success",
                 latency_ms=r["latency_ms"],
                 rows_returned=r["rows_returned"],
                 anomaly_count=r["anomaly_count"],
                 cached=r["cached"],
+                spellcheck_applied=spellcheck_applied,
+                corrected_prompt=text if spellcheck_applied else None,
             )
+            if r["status"] == "success" and log_id:
+                update_cache_log_id(q, log_id)
 
             if r["results"]:
                 last_results    = r["results"]
