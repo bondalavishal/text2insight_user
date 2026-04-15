@@ -132,6 +132,7 @@ def get_cached(question: str) -> dict | None:
                 "answer":                meta.get("answer", ""),
                 "sql":                   meta.get("sql", ""),
                 "csv_string":            meta.get("csv_string", ""),
+                "result_json":           meta.get("result_json", ""),
                 "similarity":            similarity,
                 "similarity_matched_id": int(raw_log_id) if raw_log_id else None,
             }
@@ -144,10 +145,10 @@ def get_cached(question: str) -> dict | None:
         return None
 
 
-def save_to_cache(question: str, answer: str, sql: str, csv_string: str = "") -> None:
+def save_to_cache(question: str, answer: str, sql: str, csv_string: str = "", result_json: str = "") -> None:
     """
-    Save a question+answer pair to the cache, including the CSV so that
-    cache hits can offer the user a download just like a live query would.
+    Save a question+answer pair to the cache, including the CSV and raw
+    result_json so that cache hits can re-run anomaly detection dynamically.
     """
     try:
         collection = _get_collection()
@@ -163,7 +164,8 @@ def save_to_cache(question: str, answer: str, sql: str, csv_string: str = "") ->
             ids       = [cache_id],
             documents = [question],
             metadatas = [{"answer": answer, "sql": sql,
-                          "csv_string": csv_string, "cached_at": str(time.time())}],
+                          "csv_string": csv_string, "result_json": result_json or "",
+                          "cached_at": str(time.time())}],
         )
         print(f"[Cache] Saved: {question[:60]}...")
 

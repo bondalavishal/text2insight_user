@@ -37,20 +37,8 @@ UNANSWERABLE_PATTERNS = [
         r'|seller.{0,30}review.{0,30}(over time|trend|month|improv)',
         "vw_seller_metrics has no time dimension — seller metrics are lifetime aggregates only."
     ),
-    (
-        r'categor.{0,30}cancel|cancel.{0,30}categor',
-        "vw_orders_metrics has no category column — cancellation cannot be broken down by category."
-    ),
 ]
 
-# ── SQL overrides ─────────────────────────────────────────────────────────────
-DELIVERY_OVERRIDE = re.compile(
-    r'(average|avg).{0,20}(delivery|shipping).{0,20}(time|days).{0,20}'
-    r'(by state|per state|state)', re.I)
-CANCEL_OVERRIDE = re.compile(
-    r'month.{0,30}cancel.{0,30}(rate|exceed|over|above|\d+%)', re.I)
-REVIEW_OVERRIDE = re.compile(
-    r'seller.{0,30}review.{0,30}(below|more than|point|1 point)', re.I)
 STATS_PATTERN = re.compile(
     r'(insightbot|bot).{0,20}(stat|metric|performance|pass rate)', re.I)
 
@@ -100,28 +88,6 @@ def _check_unanswerable(q: str):
 
 
 def _generate_sql_with_overrides(question: str) -> str:
-    if DELIVERY_OVERRIDE.search(question):
-        return (
-            "SELECT customer_state, ROUND(AVG(delivery_days),1) AS avg_delivery_days"
-            " FROM vw_orders_metrics WHERE delivery_days IS NOT NULL"
-            " GROUP BY customer_state ORDER BY avg_delivery_days DESC LIMIT 27"
-        )
-    if CANCEL_OVERRIDE.search(question):
-        return (
-            "SELECT year_month, total_orders, canceled_orders,"
-            " ROUND(canceled_orders*100.0/total_orders,2) AS cancel_pct"
-            " FROM vw_monthly_revenue WHERE total_orders>0"
-            " AND canceled_orders*100.0/total_orders>5"
-            " ORDER BY cancel_pct DESC LIMIT 20"
-        )
-    if REVIEW_OVERRIDE.search(question):
-        return (
-            "SELECT seller_id, seller_city, seller_state, avg_review_score, total_orders"
-            " FROM vw_seller_metrics"
-            " WHERE avg_review_score <"
-            " (SELECT AVG(avg_review_score) FROM vw_seller_metrics) - 1.0"
-            " ORDER BY avg_review_score ASC LIMIT 50"
-        )
     return generate_sql(question)
 
 

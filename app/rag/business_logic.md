@@ -1400,3 +1400,50 @@ These questions cannot be answered from available data. Return the message patte
 ```sql
 SELECT 'This question cannot be answered from the available data.' AS message LIMIT 1
 ```
+
+
+### PATTERN 81 — Learned from user query
+Question: "In 2018 august which product category had the highest cancellation rate"
+```sql
+SELECT t.product_category_name_english AS category,
+       COUNT(*) AS total_orders,
+       SUM(CASE WHEN o.order_status = 'canceled' THEN 1 ELSE 0 END) AS canceled_orders,
+       ROUND(SUM(CASE WHEN o.order_status = 'canceled' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS cancel_pct
+FROM olist_orders o
+JOIN olist_order_items i ON o.order_id = i.order_id
+JOIN olist_products p ON i.product_id = p.product_id
+JOIN product_category_translation t ON p.product_category_name = t.product_category_name
+WHERE YEAR(o.order_purchase_timestamp) = 2018
+  AND MONTH(o.order_purchase_timestamp) = 8
+GROUP BY t.product_category_name_english
+HAVING COUNT(*) > 0
+ORDER BY cancel_pct DESC
+LIMIT 1
+```
+
+
+### PATTERN 82 — Learned from user query
+Question: "which product category has high cancel rate in 2016 february"
+```sql
+SELECT t.product_category_name_english AS category, COUNT(*) AS total_orders, SUM(CASE WHEN o.order_status = 'canceled' THEN 1 ELSE 0 END) AS canceled_orders, ROUND(SUM(CASE WHEN o.order_status = 'canceled' THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0), 2) AS cancel_pct FROM olist_orders o JOIN olist_order_items i ON o.order_id = i.order_id JOIN olist_products p ON i.product_id = p.product_id JOIN product_category_translation t ON p.product_category_name = t.product_category_name WHERE YEAR(o.order_purchase_timestamp) = 2016 AND MONTH(o.order_purchase_timestamp) = 2 GROUP BY t.product_category_name_english HAVING COUNT(*) > 100 ORDER BY cancel_pct DESC LIMIT 1
+```
+
+
+### PATTERN 83 — Learned from user query
+Question: "which product category had highest cancel rate in 2018 august"
+```sql
+SELECT t.product_category_name_english AS category,
+       COUNT(*) AS total_orders,
+       SUM(CASE WHEN o.order_status = 'canceled' THEN 1 ELSE 0 END) AS canceled_orders,
+       ROUND(SUM(CASE WHEN o.order_status = 'canceled' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS cancel_pct
+FROM olist_orders o
+JOIN olist_order_items i ON o.order_id = i.order_id
+JOIN olist_products p ON i.product_id = p.product_id
+JOIN product_category_translation t ON p.product_category_name = t.product_category_name
+WHERE YEAR(o.order_purchase_timestamp) = 2018
+  AND MONTH(o.order_purchase_timestamp) = 8
+GROUP BY t.product_category_name_english
+HAVING COUNT(*) > 0
+ORDER BY cancel_pct DESC
+LIMIT 1
+```

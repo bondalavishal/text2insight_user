@@ -29,6 +29,7 @@ from app.slack.handler import (
     log,
 )
 from app.eval.cache import update_cache_log_id
+from app.rag.retriever import learn_pattern
 from app.eval.interaction_logger import (
     get_user_info,
     log_interaction,
@@ -89,15 +90,33 @@ def _answer_with_progress(
     cached_entry = get_cached(question)
     if cached_entry:
         latency_ms = int((time.time() - start) * 1000)
+
+        # Re-run anomaly detection using stored result_json so flags are
+        # always fresh — even for entries cached before flags were stored.
+        cached_answer = cached_entry["answer"]
+        anomaly_count = 0
+        try:
+            import json as _json
+            raw_json = cached_entry.get("result_json", "")
+            if raw_json:
+                cached_results = _json.loads(raw_json)
+                flags = detect_anomalies(question, cached_results)
+                if flags:
+                    cached_answer = cached_answer + "\n" + "\n".join(flags)
+                    anomaly_count = len(flags)
+        except Exception:
+            pass
+
         log(question=question, sql=cached_entry["sql"], rows_returned=0,
             latency_ms=latency_ms, cached=True, status="cache_hit")
         result.update(
-            reply=f"{prefix}{cached_entry['answer']}{DOWNLOAD_FOOTER}",
+            reply=f"{prefix}{cached_answer}{DOWNLOAD_FOOTER}",
             csv_string=cached_entry.get("csv_string", ""),
             status="cache_hit",
             sql=cached_entry["sql"],
             latency_ms=latency_ms,
             cached=True,
+            anomaly_count=anomaly_count,
             similarity_matched_id=cached_entry.get("similarity_matched_id"),
             similarity_score=cached_entry.get("similarity"),
         )
@@ -187,7 +206,7 @@ def _answer_with_progress(
     result_json = results_to_json_string(results)
     latency_ms  = int((time.time() - start) * 1000)
 
-    save_to_cache(question, summary, sql, csv_string)
+    save_to_cache(question, summary, sql, csv_string, result_json)
     log(question=question, sql=sql, rows_returned=len(results),
         latency_ms=latency_ms, cached=False, status="success",
         anomaly_count=len(flags))
@@ -411,6 +430,8 @@ def process_message(client, user: str, text: str, channel: str):
         )
         if r["status"] == "success" and log_id:
             update_cache_log_id(questions[0], log_id)
+            if not r["cached"] and r["sql"]:
+                learn_pattern(questions[0], r["sql"])
 
         _last_interaction[user] = {
             "results":    r["results"],
@@ -500,6 +521,8 @@ def process_message(client, user: str, text: str, channel: str):
             )
             if r["status"] == "success" and log_id:
                 update_cache_log_id(q, log_id)
+                if not r["cached"] and r["sql"]:
+                    learn_pattern(q, r["sql"])
 
             if r["results"]:
                 last_results    = r["results"]
