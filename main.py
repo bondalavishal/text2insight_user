@@ -259,28 +259,40 @@ def process_message(client, user: str, text: str, channel: str):
     raw_prompt = text  # preserve original for logging
 
     # ── Spellcheck — correct typos/shorthand before anything else ─────────────
-    # Skip for short messages (≤ 6 words) so feedback replies like "yes" / "no"
-    # are never mangled before the feedback classifier runs.
     spellcheck_applied = False
-    if len(text.strip().split()) > 6:
-        text = correct_prompt(text)
-        if text != raw_prompt:
-            spellcheck_applied = True
-            print(f"[InsightBot] Spellcheck applied: '{raw_prompt}' → '{text}'")
+    text = correct_prompt(text)
+    if text != raw_prompt:
+        spellcheck_applied = True
+        print(f"[InsightBot] Spellcheck applied: '{raw_prompt}' → '{text}'")
 
     last = _last_interaction.get(user)
 
     # ── Download request ──────────────────────────────────────────────────────
     if is_download_request(text):
-        if not last or not last.get("csv_string"):
+        if not last:
             client.chat_postMessage(
                 channel=channel,
-                text=(f"<@{user}> No data to download yet — "
-                      f"ask me a data question first, then reply *download*.")
+                text=(
+                    f"<@{user}> The download feature is available after you ask a data question. "
+                    f"Go ahead and ask me something — once I answer, reply with *download* to get the results as a CSV!"
+                )
             )
             return
 
-        csv_bytes = csv_string_to_bytes(last["csv_string"])
+        # Grab and clear before upload so concurrent duplicate events can't both proceed
+        csv_string = last.get("csv_string", "")
+        _last_interaction[user]["csv_string"] = ""
+        if not csv_string:
+            client.chat_postMessage(
+                channel=channel,
+                text=(
+                    f"<@{user}> Looks like you've already downloaded that one! "
+                    f"Ask me another question — once I answer, reply with *download* to get the fresh results as a CSV."
+                )
+            )
+            return
+
+        csv_bytes = csv_string_to_bytes(csv_string)
         filename  = "insightbot_data.csv"
 
         try:

@@ -1447,3 +1447,38 @@ HAVING COUNT(*) > 0
 ORDER BY cancel_pct DESC
 LIMIT 1
 ```
+
+
+### PATTERN 84 — Learned from user query
+Question: "In 2018, how many orders were cancelled in an year and in which month we saw highest cancellation percentage"
+```sql
+SELECT SUM(canceled_orders) AS total_canceled_orders,
+    month,
+    MAX(cancel_pct) AS highest_cancellation_percentage
+FROM (
+    SELECT 
+        month,
+        canceled_orders,
+        total_orders,
+        ROUND(canceled_orders * 100.0 / NULLIF(total_orders, 0), 2) AS cancel_pct
+    FROM vw_monthly_revenue
+    WHERE year = 2018
+)
+GROUP BY month, canceled_orders, total_orders
+ORDER BY highest_cancellation_percentage DESC
+LIMIT 1
+```
+
+
+### PATTERN 85 — Learned from user query
+Question: "In 2018, I want total orders fulfilled, cancelled and reviewed in an year"
+```sql
+SELECT COUNT(*) AS total_orders,
+    SUM(CASE WHEN order_status = 'canceled' THEN 1 ELSE 0 END) AS canceled_orders,
+    SUM(CASE WHEN order_status != 'canceled' THEN 1 ELSE 0 END) AS fulfilled_orders,
+    SUM(CASE WHEN review_id IS NOT NULL THEN 1 ELSE 0 END) AS reviewed_orders
+FROM olist_orders o
+LEFT JOIN olist_order_reviews r ON o.order_id = r.order_id
+WHERE YEAR(order_purchase_timestamp) = 2018
+LIMIT 1
+```
