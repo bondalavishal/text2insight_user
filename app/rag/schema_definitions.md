@@ -24,6 +24,7 @@ ONE source per query. NEVER join views. NEVER invent columns.
 ## vw_orders_metrics
 Use for: order revenue, delivery performance, order status, customer location.
 NO category column. NO seller columns. NO year_month column.
+NO raw timestamps — use delivery_days INT for TAT. order_delivered_customer_date does NOT exist on this view.
 ```sql
 CREATE VIEW vw_orders_metrics AS SELECT
     order_id       STRING,
@@ -38,7 +39,7 @@ CREATE VIEW vw_orders_metrics AS SELECT
     order_freight  DECIMAL,  -- shipping cost
     order_total    DECIMAL,  -- order_revenue + order_freight
     item_count     INT,
-    delivery_days  INT       -- NULL if not delivered
+    delivery_days  INT       -- NULL if not delivered; use AVG(delivery_days) for TAT — no timestamp columns exist
 FROM ...;
 ```
 
@@ -96,6 +97,10 @@ FROM ...;
 
 ## olist_orders
 Use for: order status + date analysis when joining to other raw tables.
+**COLUMNS THAT DO NOT EXIST on olist_orders:** `customer_state`, `seller_id`, `order_total`, `price`, `freight_value`.
+- For customer_state: JOIN olist_customers c ON o.customer_id = c.customer_id → use c.customer_state
+- For seller_id: use olist_order_items
+- For order_total / GMV: use vw_orders_metrics (view) or SUM(i.price + i.freight_value) from olist_order_items
 ```sql
 SELECT
     order_id       STRING,
@@ -169,6 +174,30 @@ SELECT
 FROM olist_sellers;
 ```
 
+## olist_customers
+Use for: customer location when joining raw tables (state/city breakdowns).
+```sql
+SELECT
+    customer_id              STRING,
+    customer_unique_id       STRING,
+    customer_zip_code_prefix BIGINT,
+    customer_city            STRING,
+    customer_state           STRING   -- 2-letter Brazilian state code
+FROM olist_customers;
+```
+
+## olist_order_payments
+Use for: payment method analysis, installment analysis, payment value breakdown.
+```sql
+SELECT
+    order_id              STRING,
+    payment_sequential    BIGINT,
+    payment_type          STRING,   -- credit_card | boleto | voucher | debit_card
+    payment_installments  BIGINT,
+    payment_value         DOUBLE
+FROM olist_order_payments;
+```
+
 ---
 
 ## Critical column rules
@@ -184,16 +213,52 @@ FROM olist_sellers;
 
 ### Category cancellations:
 ```sql
+-- COUNT(DISTINCT o.order_id) is required — the join through olist_order_items
+-- produces one row per order-item, so COUNT(*) would count items not orders.
 SELECT t.product_category_name_english AS category,
-    SUM(CASE WHEN o.order_status = 'canceled' THEN 1 ELSE 0 END) AS canceled,
-    COUNT(*) AS total,
-    ROUND(SUM(CASE WHEN o.order_status = 'canceled' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS cancel_pct
+    COUNT(DISTINCT CASE WHEN o.order_status = 'canceled' THEN o.order_id END) AS canceled_orders,
+    COUNT(DISTINCT o.order_id) AS total_orders,
+    ROUND(COUNT(DISTINCT CASE WHEN o.order_status = 'canceled' THEN o.order_id END) * 100.0 / COUNT(DISTINCT o.order_id), 2) AS cancel_pct
 FROM olist_orders o
 JOIN olist_order_items i ON o.order_id = i.order_id
 JOIN olist_products p ON i.product_id = p.product_id
 JOIN product_category_translation t ON p.product_category_name = t.product_category_name
 GROUP BY t.product_category_name_english
 ORDER BY cancel_pct DESC LIMIT 10;
+```
+
+### Multi-view monthly anomaly detection (revenue + cancellation + TAT):
+```sql
+-- vw_monthly_revenue has revenue/cancellation; vw_orders_metrics has delivery_days.
+-- Join them via CTEs when a single view cannot answer.
+WITH monthly_rev AS (
+    SELECT year, month, year_month, total_revenue, canceled_orders, total_orders,
+        LAG(total_revenue, 1) OVER (ORDER BY year, month) AS prev_revenue
+    FROM vw_monthly_revenue
+),
+monthly_tat AS (
+    SELECT order_year AS year, order_month AS month,
+        AVG(delivery_days) AS avg_tat
+    FROM vw_orders_metrics
+    WHERE delivery_days IS NOT NULL
+    GROUP BY order_year, order_month
+),
+flags AS (
+    SELECT r.year_month,
+        CASE WHEN r.prev_revenue IS NOT NULL AND r.total_revenue < 0.9 * r.prev_revenue THEN 1 ELSE 0 END AS revenue_drop,
+        CASE WHEN r.total_orders > 0 AND (r.canceled_orders * 100.0 / r.total_orders) > 5 THEN 1 ELSE 0 END AS high_cancel,
+        CASE WHEN t.avg_tat > 20 THEN 1 ELSE 0 END AS slow_tat
+    FROM monthly_rev r
+    LEFT JOIN monthly_tat t ON r.year = t.year AND r.month = t.month
+)
+SELECT year_month,
+    CASE WHEN revenue_drop = 1 THEN 'revenue_drop_>10pct_MoM' END AS flag_revenue,
+    CASE WHEN high_cancel  = 1 THEN 'cancel_rate_>5pct'       END AS flag_cancel,
+    CASE WHEN slow_tat     = 1 THEN 'avg_TAT_>20_days'        END AS flag_tat,
+    (revenue_drop + high_cancel + slow_tat) AS total_flags
+FROM flags
+WHERE (revenue_drop + high_cancel + slow_tat) >= 2
+ORDER BY year_month;
 ```
 
 ### Freight as % of price by category:
@@ -218,4 +283,246 @@ JOIN olist_products p ON i.product_id = p.product_id
 JOIN product_category_translation t ON p.product_category_name = t.product_category_name
 GROUP BY t.product_category_name_english, i.seller_id
 ORDER BY revenue DESC LIMIT 20;
+```
+
+### State + review score (olist_orders has NO customer_state — use vw_orders_metrics):
+```sql
+-- vw_orders_metrics has both order_id and customer_state, making it the correct join base
+SELECT m.customer_state,
+    AVG(r.review_score) AS avg_review
+FROM vw_orders_metrics m
+JOIN olist_order_reviews r ON m.order_id = r.order_id
+GROUP BY m.customer_state
+ORDER BY avg_review DESC LIMIT 27;
+```
+
+### Seller + review score (olist_orders has NO seller_id — use olist_order_items):
+```sql
+SELECT i.seller_id,
+    AVG(r.review_score) AS avg_review
+FROM olist_order_items i
+JOIN olist_order_reviews r ON i.order_id = r.order_id
+GROUP BY i.seller_id
+ORDER BY avg_review ASC LIMIT 20;
+```
+
+### Pareto (cumulative GMV — sellers making up first 80% of revenue):
+```sql
+-- NEVER use PERCENTILE_CONT for Pareto — it gives the 80th-percentile value, not cumulative share.
+-- Use SUM() OVER with ROWS UNBOUNDED PRECEDING for true cumulative share.
+WITH seller_gmv AS (
+    SELECT seller_id, SUM(price + freight_value) AS gmv
+    FROM olist_order_items
+    GROUP BY seller_id
+),
+total AS (SELECT SUM(gmv) AS total_gmv FROM seller_gmv),
+cumulative AS (
+    SELECT seller_id, gmv,
+        SUM(gmv) OVER (ORDER BY gmv DESC ROWS UNBOUNDED PRECEDING) AS cum_gmv
+    FROM seller_gmv
+),
+labeled AS (
+    SELECT c.seller_id, c.gmv,
+        CASE WHEN c.cum_gmv - c.gmv < t.total_gmv * 0.8 THEN 'pareto_80pct' ELSE 'rest' END AS grp
+    FROM cumulative c CROSS JOIN total t
+)
+SELECT grp,
+    COUNT(DISTINCT seller_id) AS num_sellers,
+    ROUND(SUM(gmv), 2) AS total_gmv
+FROM labeled
+GROUP BY grp
+LIMIT 10;
+```
+
+### Monthly MoM growth rate and acceleration (correct formula + no window fn in WHERE):
+```sql
+-- Rule: store LAG() as a named column in a prior CTE — never inline it in arithmetic
+-- Rule: window functions cannot appear in WHERE; filter on the CTE column instead
+WITH monthly_rev AS (
+    SELECT year, month, year_month, total_revenue,
+        LAG(total_revenue, 1) OVER (ORDER BY year, month) AS prev_revenue
+    FROM vw_monthly_revenue
+),
+growth_rates AS (
+    SELECT year_month,
+        ROUND((total_revenue - prev_revenue) * 100.0 / NULLIF(prev_revenue, 0), 2) AS mom_growth_pct
+    FROM monthly_rev
+    WHERE prev_revenue IS NOT NULL AND prev_revenue > 0   -- filter on CTE column, not on LAG()
+),
+acceleration AS (
+    SELECT year_month, mom_growth_pct,
+        LAG(mom_growth_pct, 1) OVER (ORDER BY year_month) AS prev_mom_growth_pct
+    FROM growth_rates
+)
+SELECT year_month, mom_growth_pct, prev_mom_growth_pct,
+    CASE WHEN prev_mom_growth_pct IS NOT NULL AND mom_growth_pct > prev_mom_growth_pct
+         THEN 'accelerated' ELSE 'decelerated_or_initial' END AS trend
+FROM acceleration
+WHERE prev_mom_growth_pct IS NOT NULL
+ORDER BY year_month
+LIMIT 50;
+```
+
+### YoY quarterly growth (LAG offset=4, never 3rd CTE that drops totals):
+```sql
+-- Rule: LAG offset must be 4 (same quarter prior year). NEVER 1 (that's QoQ).
+-- Rule: compute growth in the final SELECT, not a separate CTE — avoids dropping total_revenue/total_orders
+WITH quarterly AS (
+    SELECT order_year, CEIL(order_month / 3.0) AS quarter,
+        SUM(order_revenue) AS total_revenue,
+        COUNT(DISTINCT order_id) AS total_orders
+    FROM vw_orders_metrics
+    GROUP BY order_year, CEIL(order_month / 3.0)
+),
+lagged AS (
+    SELECT order_year, quarter, total_revenue, total_orders,
+        LAG(total_revenue, 4) OVER (ORDER BY order_year, quarter) AS prev_revenue,
+        LAG(total_orders, 4)  OVER (ORDER BY order_year, quarter) AS prev_orders
+    FROM quarterly
+)
+SELECT order_year, quarter, total_revenue, total_orders,
+    ROUND((total_revenue - prev_revenue) * 100.0 / NULLIF(prev_revenue, 0), 2) AS rev_yoy_growth_pct,
+    ROUND((total_orders  - prev_orders)  * 100.0 / NULLIF(prev_orders,  0), 2) AS order_yoy_growth_pct
+FROM lagged
+WHERE prev_revenue IS NOT NULL
+ORDER BY order_year, quarter
+LIMIT 20;
+```
+
+### Seller quartile → categories (multi-CTE + final JOIN for category name):
+```sql
+-- Rule: final SELECT must include its own JOINs to get English category names
+-- t alias only exists if explicitly joined in the final SELECT — CTE aliases do not propagate
+WITH seller_orders AS (
+    SELECT seller_id, COUNT(DISTINCT order_id) AS order_count
+    FROM olist_order_items GROUP BY seller_id
+),
+seller_reviews AS (
+    SELECT i.seller_id, AVG(r.review_score) AS avg_review_score
+    FROM olist_order_items i JOIN olist_order_reviews r ON i.order_id = r.order_id
+    GROUP BY i.seller_id
+),
+ranked AS (
+    SELECT o.seller_id,
+        PERCENT_RANK() OVER (ORDER BY o.order_count ASC)         AS order_rank,  -- top quartile >= 0.75
+        PERCENT_RANK() OVER (ORDER BY r.avg_review_score ASC)    AS review_rank  -- bottom quartile <= 0.25
+    FROM seller_orders o JOIN seller_reviews r ON o.seller_id = r.seller_id
+    WHERE r.avg_review_score IS NOT NULL
+)
+SELECT t.product_category_name_english AS category,
+    COUNT(DISTINCT rs.seller_id) AS num_sellers
+FROM ranked rs                               -- always alias ranked_sellers as rs (not r)
+JOIN olist_order_items i   ON rs.seller_id = i.seller_id
+JOIN olist_products p      ON i.product_id = p.product_id
+JOIN product_category_translation t ON p.product_category_name = t.product_category_name
+WHERE rs.order_rank >= 0.75 AND rs.review_rank <= 0.25
+GROUP BY t.product_category_name_english
+ORDER BY num_sellers DESC LIMIT 20;
+```
+
+### State above-avg revenue AND below-avg TAT (separate CTEs for revenue/TAT vs reviews):
+```sql
+-- Rule: "above-average revenue" for states = SUM(order_revenue) per state vs AVG of those totals
+-- Using AVG(order_revenue) gives 0 results: high-total-revenue states (SP, RJ, MG) have MANY
+-- small orders → low per-order avg, but high total revenue. Always use SUM for market size.
+-- Rule: compute revenue/TAT from vw_orders_metrics ALONE — no review join needed here
+WITH state_totals AS (
+    SELECT customer_state,
+        SUM(order_revenue) AS total_rev,
+        AVG(delivery_days) AS avg_tat
+    FROM vw_orders_metrics WHERE delivery_days IS NOT NULL GROUP BY customer_state
+),
+platform_avg AS (
+    SELECT AVG(total_rev) AS avg_rev, AVG(avg_tat) AS avg_tat FROM state_totals
+),
+state_reviews AS (
+    SELECT m.customer_state, AVG(r.review_score) AS avg_review_score
+    FROM vw_orders_metrics m JOIN olist_order_reviews r ON m.order_id = r.order_id
+    GROUP BY m.customer_state
+),
+platform_review AS (
+    SELECT AVG(r.review_score) AS avg_review_score
+    FROM vw_orders_metrics m JOIN olist_order_reviews r ON m.order_id = r.order_id
+)
+SELECT st.customer_state, st.total_rev, st.avg_tat, sr.avg_review_score,
+    pa.avg_rev AS platform_avg_rev, pa.avg_tat AS platform_avg_tat,
+    pr.avg_review_score AS platform_avg_review_score
+FROM state_totals st
+JOIN state_reviews sr ON st.customer_state = sr.customer_state
+CROSS JOIN platform_avg pa
+CROSS JOIN platform_review pr
+WHERE st.total_rev > pa.avg_rev AND st.avg_tat < pa.avg_tat
+ORDER BY sr.avg_review_score DESC LIMIT 27;
+```
+
+### Pareto + review scores per group (GROUP BY grp only — NOT by avg_review_score):
+```sql
+-- Rule: GROUP BY l.grp only — adding sr.avg_review_score to GROUP BY turns each seller
+-- into its own group, producing hundreds of rows instead of 2 summary rows
+WITH seller_gmv AS (
+    SELECT seller_id, SUM(price + freight_value) AS gmv FROM olist_order_items GROUP BY seller_id
+),
+total AS (SELECT SUM(gmv) AS total_gmv FROM seller_gmv),
+cumulative AS (
+    SELECT seller_id, gmv,
+        SUM(gmv) OVER (ORDER BY gmv DESC ROWS UNBOUNDED PRECEDING) AS cum_gmv
+    FROM seller_gmv
+),
+labeled AS (
+    SELECT c.seller_id, c.gmv,
+        CASE WHEN c.cum_gmv - c.gmv < t.total_gmv * 0.8 THEN 'pareto_80pct' ELSE 'rest' END AS grp
+    FROM cumulative c CROSS JOIN total t
+),
+seller_reviews AS (
+    SELECT i.seller_id, AVG(r.review_score) AS avg_review_score
+    FROM olist_order_items i JOIN olist_order_reviews r ON i.order_id = r.order_id
+    GROUP BY i.seller_id
+)
+SELECT l.grp,
+    COUNT(DISTINCT l.seller_id) AS num_sellers,
+    ROUND(SUM(l.gmv), 2) AS total_gmv,
+    ROUND(AVG(sr.avg_review_score), 3) AS avg_review_score   -- AVG across sellers, not per seller
+FROM labeled l
+LEFT JOIN seller_reviews sr ON l.seller_id = sr.seller_id
+GROUP BY l.grp   -- ONLY group by l.grp — never include sr.avg_review_score in GROUP BY
+ORDER BY num_sellers DESC LIMIT 10;
+```
+
+### Category risk matrix (cancel_rate + avg TAT + review in one pass — no status filter):
+```sql
+-- Rule: NEVER add WHERE order_status='delivered' — it zeros out cancel_rate
+-- Rule: tat_risk ORDER BY avg_tat_days ASC (longer TAT = rank 1) — NEVER DESC
+-- Rule: review_risk ORDER BY avg_review_score DESC (lower review = rank 1) — use directly, NEVER (1-review_risk)
+-- Formula weights: cancel 0.4 + review 0.4 + tat 0.2 = 1.0 exactly
+-- Use CASE WHEN inside aggregates to handle both metrics from all orders in one pass
+WITH category_metrics AS (
+    SELECT t.product_category_name_english AS category,
+        COUNT(DISTINCT o.order_id) AS total_orders,
+        ROUND(COUNT(DISTINCT CASE WHEN o.order_status = 'canceled' THEN o.order_id END)
+              * 100.0 / NULLIF(COUNT(DISTINCT o.order_id), 0), 2) AS cancel_rate,
+        ROUND(AVG(r.review_score), 2) AS avg_review_score,
+        ROUND(AVG(CASE WHEN o.order_status = 'delivered' AND o.order_delivered_customer_date IS NOT NULL
+                       THEN DATEDIFF(o.order_delivered_customer_date, o.order_purchase_timestamp)
+                  END), 2) AS avg_tat_days
+    FROM olist_orders o
+    JOIN olist_order_items i ON o.order_id = i.order_id
+    JOIN olist_products p ON i.product_id = p.product_id
+    JOIN product_category_translation t ON p.product_category_name = t.product_category_name
+    LEFT JOIN olist_order_reviews r ON o.order_id = r.order_id
+    GROUP BY t.product_category_name_english
+    HAVING COUNT(DISTINCT o.order_id) >= 10
+),
+risk_scores AS (
+    SELECT *,
+        PERCENT_RANK() OVER (ORDER BY cancel_rate ASC)       AS cancel_risk,   -- higher cancel = rank 1
+        PERCENT_RANK() OVER (ORDER BY avg_review_score DESC) AS review_risk,   -- lower review = rank 1
+        PERCENT_RANK() OVER (ORDER BY avg_tat_days ASC)      AS tat_risk       -- longer TAT = rank 1
+    FROM category_metrics
+    WHERE avg_tat_days IS NOT NULL
+)
+SELECT category, total_orders, cancel_rate, avg_review_score, avg_tat_days,
+    ROUND((cancel_risk * 0.4 + review_risk * 0.4 + tat_risk * 0.2), 3) AS risk_score
+FROM risk_scores
+ORDER BY risk_score DESC
+LIMIT 20;
 ```

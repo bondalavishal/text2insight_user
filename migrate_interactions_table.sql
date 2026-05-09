@@ -1,5 +1,5 @@
 -- =============================================================================
--- InsightBot — Phase 8 Table Migration
+-- text2insight — Phase 8 Table Migration
 -- Run this in your Databricks SQL editor against the default schema.
 -- =============================================================================
 

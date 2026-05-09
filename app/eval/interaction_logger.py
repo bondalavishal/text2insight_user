@@ -1,30 +1,20 @@
 """
-Interaction Logger — Phase 8 update.
-Logs every InsightBot interaction to default.insightbot_interactions in Databricks.
+Interaction Logger — logs every text2insight interaction to
+default.text2insight_user_query_log in Databricks.
 
-New columns vs Phase 7:
-  - log_id         : replaces index_id (BIGINT GENERATED ALWAYS AS IDENTITY)
-  - status         : success | cache_hit | blocked | disallowed_source | failed
-  - interaction_type: data_query | greeting | out_of_scope | stats | download
-  - raw_prompt     : original Slack text before any splitting/cleaning
-  - generated_sql  : SQL string sent to Databricks
-  - result_json    : Databricks rows serialised as a JSON string
-  - failure_reason : populated when status != success / cache_hit
-  - alternative_suggestions : bot-suggested rephrases for failed queries (future)
-  - similarity_matched_id   : log_id of the cache entry that was matched (future)
-  - self_learned   : TRUE when this answer was added to the ChromaDB cache
-  - success_signal : explicit user feedback e.g. thumbs-up reaction (future)
-  - user_notified  : TRUE if an async follow-up message was sent (future)
-  - latency_ms     : end-to-end latency in milliseconds
-  - rows_returned  : number of Databricks rows returned
-  - anomaly_count  : number of anomaly flags triggered
-  - cached         : TRUE if answer was served from ChromaDB cache
+This table is the unified interaction log and self-learning library.
+embedding_id links successful queries to their ChromaDB vector for RAG retrieval.
 """
 
 import csv
 import io
 import json
+from datetime import datetime
 from app.sql.connector import run_query
+
+_ts = lambda: datetime.now().strftime("%H:%M:%S")
+
+TABLE = "default.text2insight_user_query_log"
 
 
 def get_user_info(client, user_id: str) -> dict:
@@ -35,7 +25,7 @@ def get_user_info(client, user_id: str) -> dict:
         email_id  = user.get("profile", {}).get("email") or ""
         return {"full_name": full_name, "email_id": email_id}
     except Exception as e:
-        print(f"[InteractionLogger] Could not fetch user info: {e}")
+        print(f"{_ts()} [InteractionLogger] Could not fetch user info: {e}")
         return {"full_name": "", "email_id": ""}
 
 
@@ -64,6 +54,7 @@ def log_interaction(
     cached:                  bool  = False,
     spellcheck_applied:      bool  = False,
     corrected_prompt:        str   = None,
+    embedding_id:            str   = None,
 ) -> int | None:
 
     def esc(s):
@@ -79,7 +70,7 @@ def log_interaction(
         return str(int(val)) if val is not None else "NULL"
 
     insert_sql = f"""
-    INSERT INTO default.insightbot_interactions (
+    INSERT INTO {TABLE} (
         ts, user_id, email_id, full_name,
         raw_prompt, spellcheck_applied, corrected_prompt,
         status, interaction_type,
@@ -88,7 +79,8 @@ def log_interaction(
         failure_reason, alternative_suggestions,
         similarity_matched_id, similarity_score, self_learned,
         success_signal,
-        latency_ms, rows_returned, anomaly_count, cached
+        latency_ms, rows_returned, anomaly_count, cached,
+        embedding_id
     ) VALUES (
         CURRENT_TIMESTAMP(),
         {sql_str(user_id)},
@@ -114,48 +106,56 @@ def log_interaction(
         {sql_int(latency_ms)},
         {sql_int(rows_returned)},
         {sql_int(anomaly_count)},
-        {sql_bool(cached)}
+        {sql_bool(cached)},
+        {sql_str(embedding_id)}
     )
     """
     try:
         run_query(insert_sql)
         result = run_query(f"""
             SELECT MAX(log_id) AS last_id
-            FROM default.insightbot_interactions
+            FROM {TABLE}
             WHERE user_id = '{esc(user_id)}'
         """)
         if result:
             return result[0].get("last_id")
     except Exception as e:
-        print(f"[InteractionLogger] Failed to log interaction: {e}")
+        print(f"{_ts()} [InteractionLogger] Failed to log interaction: {e}")
     return None
 
 
+def update_embedding_id(log_id: int, embedding_id: str) -> None:
+    """Backfills the ChromaDB embedding_id after learn_pattern() completes."""
+    if not log_id or not embedding_id:
+        return
+    try:
+        run_query(f"""
+            UPDATE {TABLE}
+            SET embedding_id = '{embedding_id}'
+            WHERE log_id = {log_id}
+        """)
+    except Exception as e:
+        print(f"{_ts()} [InteractionLogger] Failed to update embedding_id: {e}")
+
+
 def update_success_signal(log_id: int, signal: str) -> None:
-    """
-    Write 'positive' or 'negative' back to success_signal for a logged interaction.
-    Called when the user reacts with an emoji or sends a short feedback reply.
-    """
     if not log_id:
         return
     try:
         run_query(f"""
-            UPDATE default.insightbot_interactions
+            UPDATE {TABLE}
             SET success_signal = '{signal}'
             WHERE log_id = {log_id}
         """)
-        print(f"[InteractionLogger] success_signal='{signal}' set on log_id={log_id}")
+        print(f"{_ts()} [InteractionLogger] success_signal='{signal}' set on log_id={log_id}")
     except Exception as e:
-        print(f"[InteractionLogger] Failed to update success_signal: {e}")
+        print(f"{_ts()} [InteractionLogger] Failed to update success_signal: {e}")
 
 
 def evict_and_mark_negative(log_id: int, question: str) -> None:
     """
-    On a negative signal:
-      1. Evicts the cached answer from ChromaDB so it won't be served again.
-      2. Sets self_learned = FALSE in Databricks to reflect the eviction.
-
-    This closes the feedback loop — a thumbs-down genuinely improves future answers.
+    On a negative signal: evicts the cached answer from ChromaDB and
+    sets self_learned = FALSE in the log table.
     """
     from app.eval.cache import evict_from_cache
 
@@ -163,13 +163,13 @@ def evict_and_mark_negative(log_id: int, question: str) -> None:
     if evicted:
         try:
             run_query(f"""
-                UPDATE default.insightbot_interactions
+                UPDATE {TABLE}
                 SET self_learned = FALSE
                 WHERE log_id = {log_id}
             """)
-            print(f"[InteractionLogger] Cache evicted + self_learned=FALSE for log_id={log_id}")
+            print(f"{_ts()} [InteractionLogger] Cache evicted + self_learned=FALSE for log_id={log_id}")
         except Exception as e:
-            print(f"[InteractionLogger] Failed to update self_learned after eviction: {e}")
+            print(f"{_ts()} [InteractionLogger] Failed to update self_learned after eviction: {e}")
 
 
 def mark_csv_downloaded(log_id: int) -> None:
@@ -177,13 +177,13 @@ def mark_csv_downloaded(log_id: int) -> None:
         return
     try:
         run_query(f"""
-            UPDATE default.insightbot_interactions
+            UPDATE {TABLE}
             SET csv_downloaded = 'yes'
             WHERE log_id = {log_id}
         """)
-        print(f"[InteractionLogger] Marked log_id={log_id} as csv_downloaded=yes")
+        print(f"{_ts()} [InteractionLogger] Marked log_id={log_id} as csv_downloaded=yes")
     except Exception as e:
-        print(f"[InteractionLogger] Failed to update csv_downloaded: {e}")
+        print(f"{_ts()} [InteractionLogger] Failed to update csv_downloaded: {e}")
 
 
 def results_to_csv_string(results: list[dict]) -> str:
@@ -201,7 +201,6 @@ def csv_string_to_bytes(csv_string: str) -> bytes:
 
 
 def results_to_json_string(results: list[dict]) -> str | None:
-    """Serialises Databricks rows to a JSON string for storage in result_json."""
     if not results:
         return None
     try:
@@ -215,9 +214,9 @@ def seed_cache_from_log() -> int:
 
     print("Re-seeding ChromaDB cache from Databricks interaction log...")
     try:
-        rows = run_query("""
+        rows = run_query(f"""
             SELECT question_asked, question_answered, generated_sql
-            FROM default.insightbot_interactions
+            FROM {TABLE}
             WHERE question_answered IS NOT NULL
               AND question_answered != ''
               AND status IN ('success', 'cache_hit')

@@ -3,6 +3,9 @@ import re
 import time
 import threading
 import concurrent.futures
+from datetime import datetime
+
+_ts = lambda: datetime.now().strftime("%H:%M:%S")
 
 from dotenv import load_dotenv
 from flask import Flask as _Flask
@@ -19,6 +22,8 @@ from app.slack.handler import (
     detect_anomalies,
     summarise_results,
     is_download_request,
+    is_explain_request,
+    generate_explanation,
     results_to_csv_string,
     STATS_PATTERN,
     DOWNLOAD_FOOTER,
@@ -53,7 +58,7 @@ _last_interaction: dict = {}
 def _progress_bar(pct: int, label: str) -> str:
     filled = int(pct / 10)
     bar    = "▓" * filled + "░" * (10 - filled)
-    return f"⏳ *InsightBot is thinking...*\n`{bar}` {pct}% — {label}"
+    return f"⏳ *text2insight is thinking...*\n`{bar}` {pct}% — {label}"
 
 
 # ── Single question pipeline ──────────────────────────────────────────────────
@@ -140,7 +145,7 @@ def _answer_with_progress(
     client.chat_update(channel=channel, ts=ts,
                        text=_progress_bar(20, "Generating SQL"))
     sql = _generate_sql_with_overrides(question)
-    print(f"[InsightBot] SQL: {sql}")
+    print(f"{_ts()} [text2insight] SQL: {sql}")
     result["sql"] = sql
 
     # ── Guardrails (40%) ──────────────────────────────────────────────────────
@@ -173,7 +178,7 @@ def _answer_with_progress(
                        text=_progress_bar(60, "Querying Databricks"))
     try:
         results = run_query(sql)
-        print(f"[InsightBot] Rows: {len(results)}")
+        print(f"{_ts()} [text2insight] Rows: {len(results)}")
     except Exception as e:
         latency_ms = int((time.time() - start) * 1000)
         log(question=question, sql=sql, latency_ms=latency_ms,
@@ -244,18 +249,18 @@ def _handle_feedback(client, user: str, channel: str, signal: str, log_id: int, 
                 f"Try asking again and I'll generate a fresh response."
             )
         )
-        print(f"[Feedback] Negative signal processed: log_id={log_id} question={question[:60]}")
+        print(f"{_ts()} [Feedback] Negative signal processed: log_id={log_id} question={question[:60]}")
     else:
         client.chat_postMessage(
             channel=channel,
             text=f"<@{user}> Thanks for the feedback! 👍"
         )
-        print(f"[Feedback] Positive signal recorded: log_id={log_id}")
+        print(f"{_ts()} [Feedback] Positive signal recorded: log_id={log_id}")
 
 
 # ── Core message handler ──────────────────────────────────────────────────────
 def process_message(client, user: str, text: str, channel: str):
-    print(f"\n[InsightBot] User={user} Text={text}")
+    print(f"\n{_ts()} [text2insight] User={user} Text={text}")
     raw_prompt = text  # preserve original for logging
 
     # ── Spellcheck — correct typos/shorthand before anything else ─────────────
@@ -263,7 +268,7 @@ def process_message(client, user: str, text: str, channel: str):
     text = correct_prompt(text)
     if text != raw_prompt:
         spellcheck_applied = True
-        print(f"[InsightBot] Spellcheck applied: '{raw_prompt}' → '{text}'")
+        print(f"{_ts()} [text2insight] Spellcheck applied: '{raw_prompt}' → '{text}'")
 
     last = _last_interaction.get(user)
 
@@ -280,9 +285,10 @@ def process_message(client, user: str, text: str, channel: str):
             return
 
         # Grab and clear before upload so concurrent duplicate events can't both proceed
-        csv_string = last.get("csv_string", "")
-        _last_interaction[user]["csv_string"] = ""
-        if not csv_string:
+        csv_files = last.get("csv_files", [])
+        _last_interaction[user]["csv_files"] = []
+        _last_interaction[user]["csv_string"] = ""  # backward-compat clear
+        if not csv_files:
             client.chat_postMessage(
                 channel=channel,
                 text=(
@@ -292,25 +298,86 @@ def process_message(client, user: str, text: str, channel: str):
             )
             return
 
-        csv_bytes = csv_string_to_bytes(csv_string)
-        filename  = "insightbot_data.csv"
+        failed = 0
+        for i, cf in enumerate(csv_files, 1):
+            slug     = re.sub(r'[^a-z0-9]+', '_', cf["question"].lower()[:30]).strip('_')
+            filename = f"text2insight_q{i}_{slug}.csv" if len(csv_files) > 1 else "text2insight_data.csv"
+            try:
+                client.files_upload_v2(
+                    channel=channel,
+                    content=csv_string_to_bytes(cf["csv_string"]),
+                    filename=filename,
+                    title=f"Q{i}: {cf['question'][:60]}" if len(csv_files) > 1 else "text2insight Data Export",
+                )
+                print(f"{_ts()} [text2insight] CSV {i}/{len(csv_files)} uploaded for user={user}")
+                if cf.get("log_id"):
+                    mark_csv_downloaded(cf["log_id"])
+            except Exception as e:
+                failed += 1
+                print(f"{_ts()} [text2insight] CSV {i} upload failed: {e}")
 
-        try:
-            client.files_upload_v2(
-                channel=channel,
-                content=csv_bytes,
-                filename=filename,
-                title="InsightBot Data Export",
-            )
-            print(f"[InsightBot] CSV uploaded for user={user}")
-            if last.get("log_id"):
-                mark_csv_downloaded(last["log_id"])
-        except Exception as e:
-            print(f"[InsightBot] CSV upload failed: {e}")
+        if failed:
             client.chat_postMessage(
                 channel=channel,
-                text=f"<@{user}> Sorry, couldn't upload the file. Try again."
+                text=f"<@{user}> {failed} file(s) couldn't be uploaded — try again."
             )
+
+        user_info = get_user_info(client, user)
+        log_interaction(
+            user_id=user, email_id=user_info.get("email_id", ""),
+            full_name=user_info.get("full_name", ""),
+            raw_prompt=raw_prompt, question_asked=text,
+            question_answered=f"CSV downloaded for: {last.get('question', '')}",
+            status="failed" if failed else "success",
+            interaction_type="download",
+            spellcheck_applied=spellcheck_applied,
+            corrected_prompt=text if spellcheck_applied else None,
+        )
+        return
+
+    # ── Explain request ───────────────────────────────────────────────────────
+    if is_explain_request(text):
+        if not last or not last.get("results"):
+            client.chat_postMessage(
+                channel=channel,
+                text=(
+                    f"<@{user}> The explain feature works after you ask a data question. "
+                    f"Ask me something first — then reply with *explain* for a detailed analysis."
+                )
+            )
+            return
+
+        question    = last.get("question", "")
+        results     = last.get("results", [])
+        print(f"{_ts()} [text2insight] Generating explanation for user={user} ({len(results)} rows)")
+
+        ts_thinking = client.chat_postMessage(
+            channel=channel,
+            text=f"<@{user}> ⏳ *Analysing your data...*"
+        )["ts"]
+
+        explanation = generate_explanation(question, results)
+        header      = f"🔍 *Detailed breakdown for:* _{question}_\n\n"
+
+        full_explanation = f"{header}{explanation}"
+        client.chat_update(
+            channel=channel,
+            ts=ts_thinking,
+            text=f"<@{user}> {full_explanation}",
+        )
+        print(f"{_ts()} [text2insight] Explanation posted for user={user}")
+
+        user_info = get_user_info(client, user)
+        log_interaction(
+            user_id=user, email_id=user_info.get("email_id", ""),
+            full_name=user_info.get("full_name", ""),
+            raw_prompt=raw_prompt, question_asked=question,
+            question_answered=full_explanation,
+            status="success", interaction_type="explain",
+            rows_returned=len(results),
+            spellcheck_applied=spellcheck_applied,
+            corrected_prompt=text if spellcheck_applied else None,
+        )
         return
 
     # ── Stats command ─────────────────────────────────────────────────────────
@@ -318,7 +385,7 @@ def process_message(client, user: str, text: str, channel: str):
         stats       = get_stats()
         cache       = cache_stats()
         stats_reply = (
-            f"<@{user}> 📊 *InsightBot Performance*\n"
+            f"<@{user}> 📊 *text2insight Performance*\n"
             f"• Total questions: {stats.get('total', 0)}\n"
             f"• Pass rate: {stats.get('pass_rate', 'N/A')}\n"
             f"• Cache hit rate: {stats.get('cache_hit_rate', 'N/A')}\n"
@@ -343,7 +410,7 @@ def process_message(client, user: str, text: str, channel: str):
 
     # ── Intent + feedback classification (single LLM call) ───────────────────
     intent = classify_intent(text)
-    print(f"[InsightBot] Intent: {intent}")
+    print(f"{_ts()} [text2insight] Intent: {intent}")
 
     # Feedback intents — only act on them if there is a prior interaction to reference
     last = _last_interaction.get(user)
@@ -356,12 +423,22 @@ def process_message(client, user: str, text: str, channel: str):
                 log_id=last["log_id"],
                 question=last["question"],
             )
+            user_info = get_user_info(client, user)
+            log_interaction(
+                user_id=user, email_id=user_info.get("email_id", ""),
+                full_name=user_info.get("full_name", ""),
+                raw_prompt=raw_prompt, question_asked=last["question"],
+                question_answered=f"Feedback signal: {signal}",
+                status="success", interaction_type=f"feedback_{signal}",
+                spellcheck_applied=spellcheck_applied,
+                corrected_prompt=text if spellcheck_applied else None,
+            )
             return
         # No prior interaction — fall through and treat as a data question
 
     if intent == "greeting":
         greeting_reply = (
-            f"Hi <@{user}>! 👋 I'm InsightBot — ask me anything about "
+            f"Hi <@{user}>! 👋 I'm text2insight — ask me anything about "
             f"orders, revenue, sellers, products or delivery performance.\n\n"
             f"You can ask multiple questions at once — "
             f"just number them or put each on a new line!"
@@ -443,13 +520,15 @@ def process_message(client, user: str, text: str, channel: str):
         if r["status"] == "success" and log_id:
             update_cache_log_id(questions[0], log_id)
             if not r["cached"] and r["sql"]:
-                learn_pattern(questions[0], r["sql"])
+                learn_pattern(questions[0], r["sql"], log_id)
 
         _last_interaction[user] = {
             "results":    r["results"],
             "csv_string": r["csv_string"],
             "log_id":     log_id,
             "question":   questions[0],
+            "csv_files":  [{"csv_string": r["csv_string"], "question": questions[0], "log_id": log_id}]
+                          if r["csv_string"] else [],
         }
 
         client.chat_update(
@@ -459,57 +538,101 @@ def process_message(client, user: str, text: str, channel: str):
         )
 
     else:
-        # ── Multi-question ────────────────────────────────────────────────────
-        print(f"[InsightBot] Multi-question: {len(questions)} questions")
-        msg = client.chat_postMessage(
-            channel=channel,
-            text=_progress_bar(5, f"Processing {len(questions)} questions")
-        )
-        ts              = msg["ts"]
-        parts           = [f"<@{user}> Here are your {len(questions)} answers:\n"]
+        # ── Multi-question: parallel execution (one progress bar per question) ─
+        print(f"{_ts()} [text2insight] Multi-question: {len(questions)} questions (parallel)")
+
+        # Post one progress bar message per question (slight stagger avoids burst)
+        bar_ts: list[str] = []
+        for i, q in enumerate(questions, 1):
+            msg = client.chat_postMessage(
+                channel=channel,
+                text=_progress_bar(10, f"Q{i}: {q[:50]}..."),
+            )
+            bar_ts.append(msg["ts"])
+            time.sleep(0.1)
+
+        ordered_results: list[dict | None] = [None] * len(questions)
         last_results    = []
         last_csv_string = ""
         last_log_id     = None
         last_question   = ""
 
-        for i, q in enumerate(questions, 1):
-            pct = int((i / len(questions)) * 90)
-            client.chat_update(
-                channel=channel,
-                ts=ts,
-                text=_progress_bar(pct, f"Question {i}/{len(questions)}: {q[:40]}...")
-            )
-            print(f"\n[InsightBot] Question {i}/{len(questions)}: {q}")
+        future_to_idx: dict = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            for idx, (q, ts_i) in enumerate(zip(questions, bar_ts)):
+                f = executor.submit(_answer_with_progress, client, channel, ts_i, q, idx + 1)
+                future_to_idx[f] = idx
 
+            # Update each message the moment its question finishes
             try:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                    future = ex.submit(
-                        _answer_with_progress, client, channel, ts, q, i
+                for future in concurrent.futures.as_completed(future_to_idx, timeout=200):
+                    idx  = future_to_idx[future]
+                    ts_i = bar_ts[idx]
+                    try:
+                        r = future.result()
+                    except Exception as exc:
+                        r = dict(
+                            reply=f"*{idx+1}.* ❌ Error: {str(exc)[:80]}",
+                            results=[], csv_string="", result_json=None,
+                            status="failed", sql="", failure_reason=str(exc),
+                            latency_ms=0, cached=False,
+                            anomaly_count=0, rows_returned=0,
+                            similarity_matched_id=None, similarity_score=None,
+                        )
+                    ordered_results[idx] = r
+                    client.chat_update(
+                        channel=channel, ts=ts_i,
+                        text=f"<@{user}> {r['reply']}",
                     )
-                    r = future.result(timeout=90)
+                    print(f"{_ts()} [text2insight] Q{idx+1} done ({r['status']})")
+
             except concurrent.futures.TimeoutError:
-                r = dict(
-                    reply=f"*{i}.* ⏱ Question timed out — try asking it separately.",
-                    results=[], csv_string="", result_json=None,
-                    status="failed", sql="",
-                    failure_reason="timeout",
-                    latency_ms=90000, cached=False,
-                    anomaly_count=0, rows_returned=0,
-                    similarity_matched_id=None,
-                )
-            except Exception as e:
-                r = dict(
-                    reply=f"*{i}.* ❌ Error: {str(e)[:80]}",
-                    results=[], csv_string="", result_json=None,
-                    status="failed", sql="",
-                    failure_reason=str(e),
-                    latency_ms=0, cached=False,
-                    anomaly_count=0, rows_returned=0,
-                    similarity_matched_id=None,
-                )
+                print(f"{_ts()} [text2insight] Parallel timeout — filling remaining with error")
+                for future, idx in future_to_idx.items():
+                    if ordered_results[idx] is None:
+                        ordered_results[idx] = dict(
+                            reply=f"*{idx+1}.* ⏱ Timed out — try asking separately.",
+                            results=[], csv_string="", result_json=None,
+                            status="failed", sql="", failure_reason="timeout",
+                            latency_ms=200000, cached=False,
+                            anomaly_count=0, rows_returned=0,
+                            similarity_matched_id=None, similarity_score=None,
+                        )
+                        client.chat_update(
+                            channel=channel, ts=bar_ts[idx],
+                            text=f"<@{user}> *{idx+1}.* ⏱ Timed out — try asking separately.",
+                        )
 
-            parts.append(r["reply"])
+        # Pre-set _last_interaction with log_id=None so concurrent download
+        # requests don't see None while the slow logging loop is still running.
+        # log_ids are backfilled into csv_files entries after each log_interaction call.
+        csv_files: list[dict] = [
+            {"csv_string": r["csv_string"], "question": questions[idx], "log_id": None}
+            for idx, r in enumerate(ordered_results)
+            if r and r.get("csv_string")
+        ]
+        _last_question_early  = next(
+            (questions[idx] for idx in range(len(ordered_results) - 1, -1, -1)
+             if ordered_results[idx] and ordered_results[idx].get("csv_string")), ""
+        )
+        _last_results_early   = next(
+            (ordered_results[idx]["results"]
+             for idx in range(len(ordered_results) - 1, -1, -1)
+             if ordered_results[idx] and ordered_results[idx].get("results")), []
+        )
+        _last_interaction[user] = {
+            "results":    _last_results_early,
+            "csv_string": csv_files[-1]["csv_string"] if csv_files else "",
+            "log_id":     None,
+            "question":   _last_question_early,
+            "csv_files":  csv_files,
+        }
 
+        # Log + cache in original question order; backfill log_ids into csv_files
+        for idx, r in enumerate(ordered_results):
+            if r is None:
+                continue
+            q = questions[idx]
             log_id = log_interaction(
                 user_id=user, email_id=email, full_name=full_name,
                 raw_prompt=raw_prompt,
@@ -522,7 +645,7 @@ def process_message(client, user: str, text: str, channel: str):
                 generated_csv=r["csv_string"] or None,
                 failure_reason=r["failure_reason"] or None,
                 similarity_matched_id=r["similarity_matched_id"],
-            similarity_score=r["similarity_score"],
+                similarity_score=r["similarity_score"],
                 self_learned=r["status"] == "success",
                 latency_ms=r["latency_ms"],
                 rows_returned=r["rows_returned"],
@@ -534,26 +657,17 @@ def process_message(client, user: str, text: str, channel: str):
             if r["status"] == "success" and log_id:
                 update_cache_log_id(q, log_id)
                 if not r["cached"] and r["sql"]:
-                    learn_pattern(q, r["sql"])
+                    learn_pattern(q, r["sql"], log_id)
 
-            if r["results"]:
-                last_results    = r["results"]
-                last_csv_string = r["csv_string"]
-                last_log_id     = log_id
-                last_question   = q
+            if r["csv_string"] and log_id:
+                for cf in _last_interaction[user]["csv_files"]:
+                    if cf["question"] == q and cf["log_id"] is None:
+                        cf["log_id"] = log_id
+                        break
 
-        _last_interaction[user] = {
-            "results":    last_results,
-            "csv_string": last_csv_string,
-            "log_id":     last_log_id,
-            "question":   last_question,
-        }
-
-        client.chat_update(
-            channel=channel,
-            ts=ts,
-            text="\n\n".join(parts)
-        )
+            if r["results"] or r["csv_string"]:
+                _last_interaction[user]["log_id"]  = log_id
+                _last_interaction[user]["question"] = q
 
 
 # ── Slack event handlers ──────────────────────────────────────────────────────
@@ -601,7 +715,7 @@ def _run_slack():
     time.sleep(3)
     while True:
         try:
-            print("InsightBot connecting to Slack...")
+            print("text2insight connecting to Slack...")
             handler = SocketModeHandler(app, os.getenv("SLACK_APP_TOKEN"))
             handler.start()
             print("Slack handler exited — reconnecting in 5s...")
@@ -612,7 +726,7 @@ def _run_slack():
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("InsightBot starting...")
+    print("text2insight starting...")
     threading.Thread(target=_run_health_server, daemon=True).start()
     print(f"Health check running on port {os.getenv('FLASK_PORT', 3000)}")
     threading.Thread(target=_run_slack, daemon=True).start()

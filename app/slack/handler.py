@@ -1,38 +1,59 @@
 """
-handler.py — Phase 7 update
-Changes from Phase 6:
-  - handle_question() now returns (reply, results, csv_string) instead of just reply
-  - Cache hit no longer shows similarity score to users
-  - Download footer added to all data responses
-  - Databricks interaction logging moved to main.py (needs Slack client for user info)
+handler.py — shared utilities used by main.py
+  - summarise_results, detect_anomalies, _split_questions, _check_unanswerable
+  - results_to_csv_string, is_download_request
+  - Re-exports: log, get_stats, cache_stats, get_cached, save_to_cache
 """
 
 import re
-import time
 import csv
 import io
 import httpx
+import concurrent.futures
+from datetime import datetime
 
-from app.llm.intent import classify_intent
+_ts = lambda: datetime.now().strftime("%H:%M:%S")
+
 from app.llm.sql_generator import generate_sql
-from app.sql.guardrails import validate_sql, enforce_limit
-from app.sql.connector import run_query
 from app.eval.cache import get_cached, save_to_cache, cache_stats
 from app.eval.logger import log, get_stats
 
 import os
 from cerebras.cloud.sdk import Cerebras as _Cerebras
+from app.llm.cerebras_breaker import is_open, record_failure, record_success
 _cerebras_client  = _Cerebras(api_key=os.getenv("CEREBRAS_API_KEY"))
 CEREBRAS_MODEL    = "qwen-3-235b-a22b-instruct-2507"
 OLLAMA_URL        = "http://127.0.0.1:11434/api/generate"
 OLLAMA_MODEL      = "mannix/defog-llama3-sqlcoder-8b"
 
-DOWNLOAD_FOOTER = "\n\n💾 *Want the full data?* Reply with *download* to get a CSV."
+# ── Groq / OpenRouter fallbacks (mirrors sql_generator.py chain) ─────────────
+_GROQ_API_KEY        = os.getenv("GROQ_API_KEY")
+_GROQ_URL            = "https://api.groq.com/openai/v1/chat/completions"
+_GROQ_SUMMARY_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "qwen/qwen3-32b",
+]
+_OPENROUTER_API_KEY        = os.getenv("OPENROUTER_API_KEY")
+_OPENROUTER_URL            = "https://openrouter.ai/api/v1/chat/completions"
+_OPENROUTER_SUMMARY_MODELS = [
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemma-4-31b-it:free",
+    "nousresearch/hermes-3-llama-3.1-405b:free",
+]
+
+DOWNLOAD_FOOTER = (
+    "\n\n💾 *Want the full data?* Reply with *download* to get a CSV."
+    "\n🔍 *Want a deeper breakdown?* Reply with *explain* for a detailed analysis."
+)
+
+# ── Explain trigger words ─────────────────────────────────────────────────────
+EXPLAIN_TRIGGERS = ["explain", "deep dive", "breakdown", "analyse this", "analyze this", "tell me more"]
 
 # ── Pre-flight unanswerable patterns ─────────────────────────────────────────
 UNANSWERABLE_PATTERNS = [
     (
-        r'seller.{0,40}(improv|trend|over time|month.by.month|histor)'
+        r'seller.{0,40}(improv|trend|over time|month[\s\-]by[\s\-]month|histor)'
         r'|(improv|trend|over time).{0,40}seller'
         r'|seller.{0,30}review.{0,30}(over time|trend|month|improv)',
         "vw_seller_metrics has no time dimension — seller metrics are lifetime aggregates only."
@@ -40,7 +61,7 @@ UNANSWERABLE_PATTERNS = [
 ]
 
 STATS_PATTERN = re.compile(
-    r'(insightbot|bot).{0,20}(stat|metric|performance|pass rate)', re.I)
+    r'(text2insight|bot).{0,20}(stat|metric|performance|pass rate)', re.I)
 
 # ── Download trigger words ────────────────────────────────────────────────────
 # "download" is shown to users in the footer
@@ -67,6 +88,154 @@ def is_download_request(text: str) -> bool:
     """Returns True if the message is a download/csv/export request."""
     t = text.lower().strip()
     return any(trigger in t for trigger in DOWNLOAD_TRIGGERS)
+
+
+def is_explain_request(text: str) -> bool:
+    """Returns True if the message is a request for a deep-dive explanation."""
+    t = text.lower().strip()
+    return any(trigger in t for trigger in EXPLAIN_TRIGGERS)
+
+
+EXPLAIN_PROMPT = """You are a senior business analyst presenting findings to a strategy team.
+
+The user asked: {question}
+
+The full dataset returned ({row_count} rows):
+{results}
+
+Deliver a structured analysis using EXACTLY the formatting below. Output the section headers in *bold* exactly as shown — do NOT use ## or ### markdown.
+
+*Overall Picture*
+2–3 sentences on what this data actually reveals. Do NOT restate the question or repeat filter criteria. State the dominant pattern, gap, or trend visible in the numbers.
+
+*Key Findings*
+• [Finding with specific number from the data]
+• [Finding with specific number from the data]
+• [Finding with specific number from the data]
+3–5 bullets. Each must cite a real number. Focus on the largest gaps, rankings, and contrasts between top and bottom performers.
+
+*Outliers & Anomalies*
+• [Outlier: name the data point, state the magnitude of deviation, give a plausible business reason]
+Identify 1–3 data points that deviate most from the norm.
+
+*Business Implications*
+2–3 sentences. Connect the pattern to a real business problem — customer trust, revenue at risk from churn, operational bottleneck. Be specific about which segments are affected. Do NOT claim an entire category's GMV is "at risk" — only a portion is.
+
+*Recommended Actions*
+1. [Specific action naming the category/metric it addresses]
+2. [Specific action naming the category/metric it addresses]
+3. [Specific action naming the category/metric it addresses]
+3–5 numbered, prioritized actions. Do NOT address actions to any specific role, team, or job title — write in first-person recommendation style ("Investigate...", "Prioritise...", "Consider..."). Each must name the specific category or metric and the outcome to target.
+
+Formatting rules — follow strictly:
+- Section headers: *bold* exactly as shown, never ##
+- Bullet points: use • for Key Findings and Outliers
+- Numbered list: use 1. 2. 3. for Recommended Actions
+- Use actual numbers from the data only — never invent figures
+- Prefix R$ for monetary values, say 'days' for delivery
+- No disclaimers, no filler sentences, no restating the question"""
+
+
+def generate_explanation(question: str, results: list[dict]) -> str:
+    """
+    Generates a structured business analyst deep-dive for the given question and results.
+    Uses the same LLM fallback chain as summarise_results.
+    """
+    if not results:
+        return "No data available to explain."
+
+    sample       = results[:50]
+    results_text = "\n".join(str(r) for r in sample)
+    if len(results) > 50:
+        results_text += f"\n... ({len(results) - 50} more rows not shown)"
+
+    prompt = EXPLAIN_PROMPT.format(
+        question=question,
+        row_count=len(results),
+        results=results_text,
+    )
+
+    # 1. Cerebras
+    _CEREBRAS_EXPLAIN_TIMEOUT = 20
+    if not is_open():
+        def _cerebras_explain():
+            return _cerebras_client.chat.completions.create(
+                model=CEREBRAS_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=600,
+            ).choices[0].message.content.strip()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                raw = ex.submit(_cerebras_explain).result(timeout=_CEREBRAS_EXPLAIN_TIMEOUT)
+            record_success()
+            print(f"{_ts()} [LLM] Explanation via Cerebras")
+            return raw
+        except concurrent.futures.TimeoutError:
+            record_failure()
+            print(f"{_ts()} [LLM] Cerebras explain timed out — trying Groq")
+        except Exception as e:
+            record_failure()
+            print(f"{_ts()} [LLM] Cerebras explain failed ({e}) — trying Groq")
+    else:
+        print(f"{_ts()} [LLM] Cerebras circuit open — skipping to Groq")
+
+    # 2. Groq
+    if _GROQ_API_KEY:
+        for model in _GROQ_SUMMARY_MODELS:
+            try:
+                r = httpx.post(
+                    _GROQ_URL,
+                    headers={"Authorization": f"Bearer {_GROQ_API_KEY}", "Content-Type": "application/json"},
+                    json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                          "temperature": 0, "max_tokens": 600},
+                    timeout=30,
+                )
+                if r.status_code in (429, 413):
+                    print(f"{_ts()} [LLM] Groq {model} skipped ({r.status_code}) — next model")
+                    continue
+                r.raise_for_status()
+                print(f"{_ts()} [LLM] Explanation via Groq ({model})")
+                return r.json()["choices"][0]["message"]["content"].strip()
+            except Exception as ex:
+                print(f"{_ts()} [LLM] Groq {model} failed ({ex}) — next model")
+
+    # 3. OpenRouter
+    if _OPENROUTER_API_KEY:
+        for model in _OPENROUTER_SUMMARY_MODELS:
+            try:
+                r = httpx.post(
+                    _OPENROUTER_URL,
+                    headers={"Authorization": f"Bearer {_OPENROUTER_API_KEY}",
+                             "Content-Type": "application/json",
+                             "HTTP-Referer": "https://text2insight.app",
+                             "X-Title": "text2insight"},
+                    json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                          "temperature": 0, "max_tokens": 600},
+                    timeout=45,
+                )
+                if r.status_code == 429:
+                    print(f"{_ts()} [LLM] OpenRouter {model} rate-limited — next model")
+                    continue
+                r.raise_for_status()
+                print(f"{_ts()} [LLM] Explanation via OpenRouter ({model})")
+                return r.json()["choices"][0]["message"]["content"].strip()
+            except Exception as ex:
+                print(f"{_ts()} [LLM] OpenRouter {model} failed ({ex}) — next model")
+
+    # 4. Ollama
+    try:
+        response = httpx.post(OLLAMA_URL, json={
+            "model":   OLLAMA_MODEL,
+            "prompt":  prompt,
+            "stream":  False,
+            "options": {"temperature": 0, "num_predict": 600}
+        }, timeout=120)
+        print(f"{_ts()} [LLM] Explanation via Ollama (last resort)")
+        return response.json()["response"].strip()
+    except Exception as e:
+        print(f"{_ts()} [LLM] Ollama explain also failed ({e})")
+        return "Explanation unavailable — see the data above."
 
 
 def results_to_csv_string(results: list[dict]) -> str:
@@ -183,21 +352,76 @@ def summarise_results(question: str, results: list[dict]) -> str:
         results_text += f"\n... and {len(results)-20} more rows."
     prompt = SUMMARY_PROMPT.format(question=question, results=results_text)
 
-    # Primary: Cerebras
-    try:
-        resp = _cerebras_client.chat.completions.create(
-            model=CEREBRAS_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_tokens=100,
-            timeout=30,
-        )
-        print("[LLM] Summary via Cerebras")
-        return _clean_summary(resp.choices[0].message.content.strip())
-    except Exception as e:
-        print(f"[LLM] Cerebras summary failed ({e}) — falling back to Ollama")
+    # 1. Cerebras (hard 10s wall-clock timeout)
+    _CEREBRAS_SUMMARY_TIMEOUT = 10
+    if not is_open():
+        def _cerebras_summary():
+            return _cerebras_client.chat.completions.create(
+                model=CEREBRAS_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=100,
+            ).choices[0].message.content.strip()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                raw = ex.submit(_cerebras_summary).result(timeout=_CEREBRAS_SUMMARY_TIMEOUT)
+            result = _clean_summary(raw)
+            record_success()
+            print(f"{_ts()} [LLM] Summary via Cerebras")
+            return result
+        except concurrent.futures.TimeoutError:
+            record_failure()
+            print(f"{_ts()} [LLM] Cerebras summary timed out after {_CEREBRAS_SUMMARY_TIMEOUT}s — trying Groq")
+        except Exception as e:
+            record_failure()
+            print(f"{_ts()} [LLM] Cerebras summary failed ({e}) — trying Groq")
+    else:
+        print(f"{_ts()} [LLM] Cerebras circuit open — skipping to Groq")
 
-    # Fallback: Ollama
+    # 2. Groq
+    if _GROQ_API_KEY:
+        for model in _GROQ_SUMMARY_MODELS:
+            try:
+                r = httpx.post(
+                    _GROQ_URL,
+                    headers={"Authorization": f"Bearer {_GROQ_API_KEY}", "Content-Type": "application/json"},
+                    json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                          "temperature": 0, "max_tokens": 100},
+                    timeout=30,
+                )
+                if r.status_code in (429, 413):
+                    print(f"{_ts()} [LLM] Groq {model} skipped ({r.status_code}) — next model")
+                    continue
+                r.raise_for_status()
+                print(f"{_ts()} [LLM] Summary via Groq ({model})")
+                return _clean_summary(r.json()["choices"][0]["message"]["content"].strip())
+            except Exception as ex:
+                print(f"{_ts()} [LLM] Groq {model} failed ({ex}) — next model")
+
+    # 3. OpenRouter
+    if _OPENROUTER_API_KEY:
+        for model in _OPENROUTER_SUMMARY_MODELS:
+            try:
+                r = httpx.post(
+                    _OPENROUTER_URL,
+                    headers={"Authorization": f"Bearer {_OPENROUTER_API_KEY}",
+                             "Content-Type": "application/json",
+                             "HTTP-Referer": "https://text2insight.app",
+                             "X-Title": "text2insight"},
+                    json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                          "temperature": 0, "max_tokens": 100},
+                    timeout=45,
+                )
+                if r.status_code == 429:
+                    print(f"{_ts()} [LLM] OpenRouter {model} rate-limited — next model")
+                    continue
+                r.raise_for_status()
+                print(f"{_ts()} [LLM] Summary via OpenRouter ({model})")
+                return _clean_summary(r.json()["choices"][0]["message"]["content"].strip())
+            except Exception as ex:
+                print(f"{_ts()} [LLM] OpenRouter {model} failed ({ex}) — next model")
+
+    # 4. Ollama (last resort)
     try:
         response = httpx.post(OLLAMA_URL, json={
             "model":   OLLAMA_MODEL,
@@ -205,10 +429,10 @@ def summarise_results(question: str, results: list[dict]) -> str:
             "stream":  False,
             "options": {"temperature": 0, "num_predict": 100}
         }, timeout=120)
-        print("[LLM] Summary via Ollama (fallback)")
+        print("[LLM] Summary via Ollama (last resort)")
         return _clean_summary(response.json()["response"].strip())
     except Exception as e:
-        print(f"[LLM] Ollama summary also failed ({e})")
+        print(f"{_ts()} [LLM] Ollama summary also failed ({e})")
         return "Summary unavailable — here is the raw data above."
 
 
@@ -224,91 +448,3 @@ def _split_questions(text: str) -> list[str]:
              if p.strip() and len(p.strip()) > 10]
     if len(parts) > 1: return parts
     return [text.strip()]
-
-
-# ── Main handler ──────────────────────────────────────────────────────────────
-
-def handle_question(user_id: str, question: str) -> tuple:
-    """
-    Returns: (reply: str, results: list[dict], csv_string: str)
-      - reply      → text to post in Slack
-      - results    → raw Databricks rows (empty list if not a data query)
-      - csv_string → CSV string of results (empty string if not a data query)
-    """
-    print(f"\n[InsightBot] User: {question}")
-    start = time.time()
-
-    # ── Cache check ───────────────────────────────────────────────────────────
-    cached = get_cached(question)
-    if cached:
-        log(question=question, sql=cached["sql"],
-            latency_sec=round(time.time()-start, 2),
-            cached=True, status="cache_hit")
-        # No similarity score shown to user — clean answer only
-        reply = f"<@{user_id}> {cached['answer']}{DOWNLOAD_FOOTER}"
-        return reply, [], ""
-
-    # ── Intent ────────────────────────────────────────────────────────────────
-    intent = classify_intent(question)
-    if intent == "greeting":
-        reply = (f"Hi <@{user_id}>! 👋 I'm InsightBot — ask me anything about "
-                 f"orders, revenue, sellers, products or delivery performance.")
-        return reply, [], ""
-    if intent == "out_of_scope":
-        reply = (f"Sorry <@{user_id}>, I can only answer questions about "
-                 f"business data — orders, revenue, sellers, products, delivery.")
-        return reply, [], ""
-
-    # ── Pre-flight ────────────────────────────────────────────────────────────
-    reason = _check_unanswerable(question)
-    if reason:
-        log(question=question, latency_sec=round(time.time()-start, 2),
-            status="blocked", error=reason)
-        reply = f"<@{user_id}> Sorry, that can't be answered: {reason}"
-        return reply, [], ""
-
-    # ── SQL generation ────────────────────────────────────────────────────────
-    sql = _generate_sql_with_overrides(question)
-    print(f"[InsightBot] SQL: {sql[:80]}...")
-
-    is_valid, reason = validate_sql(sql)
-    if not is_valid:
-        log(question=question, sql=sql,
-            latency_sec=round(time.time()-start, 2),
-            status="fail", error=reason)
-        reply = f"Sorry <@{user_id}>, couldn't generate a safe query. Try rephrasing."
-        return reply, [], ""
-
-    sql = enforce_limit(sql)
-
-    # ── Databricks execution ──────────────────────────────────────────────────
-    try:
-        results = run_query(sql)
-        print(f"[InsightBot] Rows: {len(results)}")
-    except Exception as e:
-        log(question=question, sql=sql,
-            latency_sec=round(time.time()-start, 2),
-            status="fail", error=str(e))
-        reply = f"Sorry <@{user_id}>, query error. Try rephrasing."
-        return reply, [], ""
-
-    # ── Anomaly detection ─────────────────────────────────────────────────────
-    flags  = detect_anomalies(question, results)
-    summary = summarise_results(question, results)
-
-    # ── Build reply ───────────────────────────────────────────────────────────
-    reply = summary
-    if flags:
-        reply += "\n" + "\n".join(flags)
-    reply += DOWNLOAD_FOOTER
-
-    # ── Generate CSV string ───────────────────────────────────────────────────
-    csv_string = results_to_csv_string(results)
-
-    # ── Cache + eval log ──────────────────────────────────────────────────────
-    latency = round(time.time()-start, 2)
-    save_to_cache(question, summary, sql)
-    log(question=question, sql=sql, rows_returned=len(results),
-        latency_sec=latency, status="pass", anomalies=len(flags))
-
-    return f"<@{user_id}> {reply}", results, csv_string

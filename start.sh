@@ -9,5 +9,5 @@ else
     echo "chroma_db exists — skipping rebuild."
 fi
 
-echo "Starting InsightBot..."
+echo "Starting text2insight..."
 exec python main.py

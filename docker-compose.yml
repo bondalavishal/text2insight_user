@@ -1,7 +1,7 @@
 version: "3.9"
 
 services:
-  insightbot:
+  text2insight:
     build: .
     restart: unless-stopped
     env_file:

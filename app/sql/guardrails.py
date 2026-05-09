@@ -35,7 +35,10 @@ def validate_sql(sql: str) -> tuple[bool, str, str]:
       - "blocked_keyword"    : contains a DDL / write keyword
       - "disallowed_source"  : references a table/view not in ALLOWED_SOURCES
     """
-    sql_upper = sql.strip().upper()
+    # Strip leading SQL comments before checking start — models sometimes
+    # prepend a -- comment line before the WITH/SELECT keyword
+    sql_stripped = re.sub(r'^\s*(--[^\n]*\n\s*)*', '', sql.strip())
+    sql_upper = sql_stripped.strip().upper()
 
     if not (sql_upper.startswith("SELECT") or sql_upper.startswith("WITH")):
         return False, "Query must start with SELECT or WITH.", "invalid_start"
@@ -44,7 +47,7 @@ def validate_sql(sql: str) -> tuple[bool, str, str]:
         if re.search(r'\b' + keyword + r'\b', sql_upper):
             return False, f"Blocked keyword: {keyword}", "blocked_keyword"
 
-    if not any(source.lower() in sql.lower() for source in ALLOWED_SOURCES):
+    if not any(source.lower() in sql_stripped.lower() for source in ALLOWED_SOURCES):
         return False, "Query must reference an allowed view or table.", "disallowed_source"
 
     return True, "OK", "ok"

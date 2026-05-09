@@ -9,6 +9,9 @@ import os
 import re
 import time
 import chromadb
+from datetime import datetime
+
+_ts = lambda: datetime.now().strftime("%H:%M:%S")
 from chromadb.utils import embedding_functions
 from app.sql.connector import run_query
 
@@ -31,12 +34,12 @@ def _get_collection():
         _client = chromadb.PersistentClient(path=CHROMA_DIR)
         try:
             _collection = _client.get_collection(
-                name="insightbot_cache",
+                name="text2insight_cache",
                 embedding_function=_ef,
             )
         except Exception:
             _collection = _client.create_collection(
-                name="insightbot_cache",
+                name="text2insight_cache",
                 embedding_function=_ef,
                 metadata={"hnsw:space": "cosine"},
             )
@@ -70,17 +73,17 @@ def _db_lookup_log_id(cached_question: str) -> int | None:
     try:
         esc = cached_question.replace("'", "''")
         rows = run_query(
-            f"SELECT log_id FROM default.insightbot_interactions "
+            f"SELECT log_id FROM default.text2insight_user_query_log "
             f"WHERE question_asked = '{esc}' AND self_learned = TRUE "
             f"ORDER BY ts DESC LIMIT 1"
         )
         if rows:
             log_id = rows[0].get("log_id")
             if log_id:
-                print(f"[Cache] Backfilled log_id={log_id} for: {cached_question[:60]}...")
+                print(f"{_ts()} [Cache] Backfilled log_id={log_id} for: {cached_question[:60]}...")
             return log_id
     except Exception as e:
-        print(f"[Cache] DB lookup for log_id failed: {e}")
+        print(f"{_ts()} [Cache] DB lookup for log_id failed: {e}")
     return None
 
 
@@ -117,7 +120,7 @@ def get_cached(question: str) -> dict | None:
                     f"for: {question[:60]}..."
                 )
                 return None
-            print(f"[Cache] HIT (similarity={similarity}) for: {question[:60]}...")
+            print(f"{_ts()} [Cache] HIT (similarity={similarity}) for: {question[:60]}...")
             raw_log_id = meta.get("log_id")
 
             # Fallback for old cache entries that predate log_id storage:
@@ -137,11 +140,11 @@ def get_cached(question: str) -> dict | None:
                 "similarity_matched_id": int(raw_log_id) if raw_log_id else None,
             }
 
-        print(f"[Cache] MISS (similarity={similarity}) for: {question[:60]}...")
+        print(f"{_ts()} [Cache] MISS (similarity={similarity}) for: {question[:60]}...")
         return None
 
     except Exception as e:
-        print(f"[Cache] Error during lookup: {e}")
+        print(f"{_ts()} [Cache] Error during lookup: {e}")
         return None
 
 
@@ -167,10 +170,10 @@ def save_to_cache(question: str, answer: str, sql: str, csv_string: str = "", re
                           "csv_string": csv_string, "result_json": result_json or "",
                           "cached_at": str(time.time())}],
         )
-        print(f"[Cache] Saved: {question[:60]}...")
+        print(f"{_ts()} [Cache] Saved: {question[:60]}...")
 
     except Exception as e:
-        print(f"[Cache] Error during save: {e}")
+        print(f"{_ts()} [Cache] Error during save: {e}")
 
 
 def update_cache_log_id(question: str, log_id: int) -> None:
@@ -188,7 +191,7 @@ def update_cache_log_id(question: str, log_id: int) -> None:
             meta["log_id"] = str(log_id)
             collection.update(ids=[cache_id], metadatas=[meta])
     except Exception as e:
-        print(f"[Cache] Failed to attach log_id to cache entry: {e}")
+        print(f"{_ts()} [Cache] Failed to attach log_id to cache entry: {e}")
 
 
 def evict_from_cache(question: str) -> bool:
@@ -202,10 +205,10 @@ def evict_from_cache(question: str) -> bool:
         collection = _get_collection()
         cache_id   = f"cache_{abs(hash(question.lower().strip()))}"
         collection.delete(ids=[cache_id])
-        print(f"[Cache] Evicted: {question[:60]}...")
+        print(f"{_ts()} [Cache] Evicted: {question[:60]}...")
         return True
     except Exception as e:
-        print(f"[Cache] Error during eviction: {e}")
+        print(f"{_ts()} [Cache] Error during eviction: {e}")
         return False
 
 

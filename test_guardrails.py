@@ -12,7 +12,7 @@ tests = [
 ]
 
 for sql, expected in tests:
-    is_valid, reason = validate_sql(sql)
+    is_valid, reason, _ = validate_sql(sql)
     enforced = enforce_limit(sql) if is_valid else sql
     status = "✅" if is_valid == expected else "❌"
     print(f"{status} valid={is_valid} | {reason}")
@@ -30,7 +30,7 @@ questions = [
 
 for q in questions:
     sql = generate_sql(q)
-    is_valid, reason = validate_sql(sql)
+    is_valid, reason, _ = validate_sql(sql)
     icon = "✅" if is_valid else "❌"
     print(f"{icon} Q: {q}")
     print(f"   SQL: {sql}")
