@@ -1,5 +1,6 @@
 import os
 import re
+import threading
 import httpx
 import concurrent.futures
 from datetime import datetime
@@ -32,7 +33,6 @@ GROQ_MODELS  = [
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS  = [
-    "openrouter/free",                                               # auto-selects best free model
     "openrouter/elephant-alpha",                                     # 262K ctx
     "google/gemma-4-26b-a4b-it:free",                               # 262K ctx
     "google/gemma-4-31b-it:free",                                    # 262K ctx
@@ -88,7 +88,7 @@ STRICT RULES:
 - For cancellations from vw_orders_metrics: SUM(CASE WHEN order_status = 'canceled' THEN 1 ELSE 0 END)
 - For category-level cancellations: join olist_orders + olist_order_items + olist_products + product_category_translation
 - For payment analysis: use olist_order_payments (join to olist_orders on order_id)
-- For customer geography: use olist_customers (join to olist_orders on customer_id)
+- For customer geography / state distribution: vw_orders_metrics already has BOTH customer_state AND customer_id as direct columns — ALWAYS use it first for state-level questions. Example: "which state has most customers" → SELECT customer_state, COUNT(DISTINCT customer_id) AS num_customers FROM vw_orders_metrics GROUP BY customer_state ORDER BY num_customers DESC LIMIT 1. Only use olist_customers when you explicitly need customer_unique_id or city-level data not in the view
 - For year comparisons: use vw_monthly_revenue GROUP BY year
 - olist_orders ONLY has: order_id, customer_id, order_status, timestamps — it has NO customer_state, NO seller_id, NO order_total, NO price, NO freight_value. Never reference these on olist_orders
 - For customer_state from raw tables: JOIN olist_customers c ON o.customer_id = c.customer_id, then use c.customer_state
@@ -104,6 +104,7 @@ AGGREGATION RULES (prevent fan-out bugs):
 - For canceled order counts through olist_order_items: use COUNT(DISTINCT CASE WHEN o.order_status = 'canceled' THEN o.order_id END) — not SUM(CASE WHEN ...)
 - Payment fan-out: NEVER join olist_order_payments directly to olist_order_items — this multiplies payment rows by item count. Always aggregate payments at order level first in a CTE: WITH order_payments AS (SELECT order_id, SUM(payment_value) AS total_paid FROM olist_order_payments GROUP BY order_id), then join that CTE to olist_orders
 - Payment averages: olist_order_payments has one row per installment — never AVG(payment_value) on raw rows; always SUM per order_id first
+- Payment type + avg order value pattern — EXACT STRUCTURE: (1) CTE `order_payments` keeps order_id: SELECT order_id, payment_type, SUM(payment_value) AS total_paid FROM olist_order_payments GROUP BY order_id, payment_type — NEVER group by payment_type alone here (loses order_id needed for the join); (2) CTE `order_items` aggregates GMV: SELECT order_id, SUM(price + freight_value) AS order_gmv FROM olist_order_items GROUP BY order_id; (3) final SELECT: JOIN order_payments op to order_items oi ON op.order_id = oi.order_id, then GROUP BY op.payment_type, computing COUNT(DISTINCT op.order_id) AS num_orders and AVG(oi.order_gmv) AS avg_order_value
 - TAT delivery filter: when computing delivery time from raw tables, always filter WHERE o.order_status = 'delivered' AND o.order_delivered_customer_date IS NOT NULL to exclude undelivered orders from the average
 - MoM growth rate formula: ALWAYS parenthesize correctly — ROUND((current - prev) * 100.0 / NULLIF(prev, 0), 2). NEVER inline LAG() in arithmetic: `value - LAG() * 1.0 / LAG()` evaluates as `value - 1.0` due to operator precedence — always store LAG() result as a named column in a prior CTE, then reference that column
 - YoY quarterly growth pattern — EXACT STRUCTURE: (1) CTE `quarterly` groups by order_year + CEIL(order_month/3.0) AS quarter, computes SUM(order_revenue) AS total_revenue + COUNT(DISTINCT order_id) AS total_orders; (2) CTE `lagged` selects ALL columns from quarterly PLUS LAG(total_revenue, 4) OVER (ORDER BY order_year, quarter) AS prev_revenue AND LAG(total_orders, 4) OVER (ORDER BY order_year, quarter) AS prev_orders — offset MUST be 4 (same quarter prior year), NEVER 1 (that is QoQ); (3) final SELECT reads order_year, quarter, total_revenue, total_orders, ROUND((total_revenue-prev_revenue)*100.0/NULLIF(prev_revenue,0),2) AS rev_growth_pct, ROUND((total_orders-prev_orders)*100.0/NULLIF(prev_orders,0),2) AS order_growth_pct FROM lagged WHERE prev_revenue IS NOT NULL — NEVER add a third CTE that drops total_revenue/total_orders then tries to read them in the outer SELECT (column-not-found crash)
@@ -161,38 +162,49 @@ def _extract_sql(raw: str) -> str:
             sql = plain_match.group(1).strip()
         else:
             fallback = re.search(r'(?im)^(WITH|SELECT)\b', raw)
-            sql = raw[fallback.start():].strip() if fallback else raw.strip()
+            if not fallback:
+                raise ValueError("No SQL found in LLM response — skipping this provider")
+            sql = raw[fallback.start():].strip()
     sql = sql.rstrip(";").strip()
+    # Reject reasoning/chain-of-thought responses that slipped past fence detection
+    if not re.match(r'(?i)^\s*(WITH|SELECT)\b', sql):
+        raise ValueError("LLM returned reasoning text instead of SQL — skipping this provider")
     sql = re.sub(r'(?i)^(SELECT\s+)+', 'SELECT ', sql)
     sql = sql.replace("p.product_category_name_english", "t.product_category_name_english")
     return sql.strip()
 
 
-_CEREBRAS_SQL_TIMEOUT = 15   # hard wall-clock seconds before falling to Groq
+_CEREBRAS_SQL_TIMEOUT = 5    # hard wall-clock seconds before falling to Groq
+_cerebras_lock = threading.Lock()  # serialize parallel calls so 2nd+ see open circuit
 
 def _via_cerebras(prompt: str) -> str:
-    if is_open():
-        raise RuntimeError("Cerebras circuit open")
+    with _cerebras_lock:
+        if is_open():
+            raise RuntimeError("Cerebras circuit open")
 
-    def _call():
-        return _cerebras.chat.completions.create(
-            model=CEREBRAS_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_tokens=512,
-        ).choices[0].message.content.strip()
+        def _call():
+            return _cerebras.chat.completions.create(
+                model=CEREBRAS_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=512,
+            ).choices[0].message.content.strip()
 
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            result = ex.submit(_call).result(timeout=_CEREBRAS_SQL_TIMEOUT)
-        record_success()
-        return result
-    except concurrent.futures.TimeoutError:
-        record_failure()
-        raise RuntimeError(f"Cerebras SQL timed out after {_CEREBRAS_SQL_TIMEOUT}s")
-    except Exception as e:
-        record_failure()
-        raise
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future   = executor.submit(_call)
+        try:
+            result = future.result(timeout=_CEREBRAS_SQL_TIMEOUT)
+            executor.shutdown(wait=False)
+            record_success()
+            return result
+        except concurrent.futures.TimeoutError:
+            executor.shutdown(wait=False)  # release lock without waiting for Cerebras HTTP call
+            record_failure()
+            raise RuntimeError(f"Cerebras SQL timed out after {_CEREBRAS_SQL_TIMEOUT}s")
+        except Exception as e:
+            executor.shutdown(wait=False)
+            record_failure()
+            raise
 
 
 def _via_groq(prompt: str) -> str:

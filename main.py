@@ -337,7 +337,10 @@ def process_message(client, user: str, text: str, channel: str):
 
     # ── Explain request ───────────────────────────────────────────────────────
     if is_explain_request(text):
-        if not last or not last.get("results"):
+        explain_items = last.get("explain_items", []) if last else []
+        if not explain_items and last and last.get("results"):
+            explain_items = [{"results": last["results"], "question": last.get("question", "")}]
+        if not explain_items:
             client.chat_postMessage(
                 channel=channel,
                 text=(
@@ -347,37 +350,42 @@ def process_message(client, user: str, text: str, channel: str):
             )
             return
 
-        question    = last.get("question", "")
-        results     = last.get("results", [])
-        print(f"{_ts()} [text2insight] Generating explanation for user={user} ({len(results)} rows)")
+        n = len(explain_items)
+        print(f"{_ts()} [text2insight] Generating {n} explanation(s) for user={user}")
 
         ts_thinking = client.chat_postMessage(
             channel=channel,
-            text=f"<@{user}> ⏳ *Analysing your data...*"
+            text=f"<@{user}> ⏳ *Analysing {'your data' if n == 1 else f'{n} questions'}...*"
         )["ts"]
 
-        explanation = generate_explanation(question, results)
-        header      = f"🔍 *Detailed breakdown for:* _{question}_\n\n"
-
-        full_explanation = f"{header}{explanation}"
-        client.chat_update(
-            channel=channel,
-            ts=ts_thinking,
-            text=f"<@{user}> {full_explanation}",
-        )
-        print(f"{_ts()} [text2insight] Explanation posted for user={user}")
-
         user_info = get_user_info(client, user)
-        log_interaction(
-            user_id=user, email_id=user_info.get("email_id", ""),
-            full_name=user_info.get("full_name", ""),
-            raw_prompt=raw_prompt, question_asked=question,
-            question_answered=full_explanation,
-            status="success", interaction_type="explain",
-            rows_returned=len(results),
-            spellcheck_applied=spellcheck_applied,
-            corrected_prompt=text if spellcheck_applied else None,
-        )
+        first_explanation = None
+
+        for i, item in enumerate(explain_items):
+            q_text  = item["question"]
+            results = item["results"]
+            explanation = generate_explanation(q_text, results)
+            header  = f"🔍 *{'Detailed breakdown' if n == 1 else f'Q{i+1} breakdown'}:* _{q_text}_\n\n"
+            full_explanation = f"{header}{explanation}"
+
+            if i == 0:
+                client.chat_update(channel=channel, ts=ts_thinking, text=f"<@{user}> {full_explanation}")
+                first_explanation = full_explanation
+            else:
+                client.chat_postMessage(channel=channel, text=f"<@{user}> {full_explanation}")
+
+            log_interaction(
+                user_id=user, email_id=user_info.get("email_id", ""),
+                full_name=user_info.get("full_name", ""),
+                raw_prompt=raw_prompt, question_asked=q_text,
+                question_answered=full_explanation,
+                status="success", interaction_type="explain",
+                rows_returned=len(results),
+                spellcheck_applied=spellcheck_applied,
+                corrected_prompt=text if spellcheck_applied else None,
+            )
+
+        print(f"{_ts()} [text2insight] Explanation(s) posted for user={user}")
         return
 
     # ── Stats command ─────────────────────────────────────────────────────────
@@ -523,12 +531,14 @@ def process_message(client, user: str, text: str, channel: str):
                 learn_pattern(questions[0], r["sql"], log_id)
 
         _last_interaction[user] = {
-            "results":    r["results"],
-            "csv_string": r["csv_string"],
-            "log_id":     log_id,
-            "question":   questions[0],
-            "csv_files":  [{"csv_string": r["csv_string"], "question": questions[0], "log_id": log_id}]
-                          if r["csv_string"] else [],
+            "results":      r["results"],
+            "csv_string":   r["csv_string"],
+            "log_id":       log_id,
+            "question":     questions[0],
+            "csv_files":    [{"csv_string": r["csv_string"], "question": questions[0], "log_id": log_id}]
+                            if r["csv_string"] else [],
+            "explain_items": [{"results": r["results"], "question": questions[0]}]
+                             if r["results"] else [],
         }
 
         client.chat_update(
@@ -611,6 +621,11 @@ def process_message(client, user: str, text: str, channel: str):
             for idx, r in enumerate(ordered_results)
             if r and r.get("csv_string")
         ]
+        explain_items_early: list[dict] = [
+            {"results": r["results"], "question": questions[idx]}
+            for idx, r in enumerate(ordered_results)
+            if r and r.get("results")
+        ]
         _last_question_early  = next(
             (questions[idx] for idx in range(len(ordered_results) - 1, -1, -1)
              if ordered_results[idx] and ordered_results[idx].get("csv_string")), ""
@@ -621,11 +636,12 @@ def process_message(client, user: str, text: str, channel: str):
              if ordered_results[idx] and ordered_results[idx].get("results")), []
         )
         _last_interaction[user] = {
-            "results":    _last_results_early,
-            "csv_string": csv_files[-1]["csv_string"] if csv_files else "",
-            "log_id":     None,
-            "question":   _last_question_early,
-            "csv_files":  csv_files,
+            "results":      _last_results_early,
+            "csv_string":   csv_files[-1]["csv_string"] if csv_files else "",
+            "log_id":       None,
+            "question":     _last_question_early,
+            "csv_files":    csv_files,
+            "explain_items": explain_items_early,
         }
 
         # Log + cache in original question order; backfill log_ids into csv_files
@@ -673,6 +689,12 @@ def process_message(client, user: str, text: str, channel: str):
 # ── Slack event handlers ──────────────────────────────────────────────────────
 @app.message("")
 def handle_message(message, client):
+    # Only handle DMs here — channel messages come through handle_mention
+    # This prevents double-processing when both handlers fire for @mention events
+    if message.get("channel_type") != "im":
+        return
+    if message.get("bot_id") or message.get("subtype"):
+        return
     user    = message.get("user", "unknown")
     text    = message.get("text", "").strip()
     channel = message.get("channel", "")
