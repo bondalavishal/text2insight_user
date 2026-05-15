@@ -10,6 +10,7 @@ import os
 import threading
 import chromadb
 from datetime import datetime
+from app.utils import quiet_macos
 
 _ts = lambda: datetime.now().strftime("%H:%M:%S")
 from chromadb.utils import embedding_functions
@@ -55,11 +56,12 @@ def retrieve(question: str, top_k: int = 5, min_relevance: float = 0.5) -> str:
             return ""
 
         n = min(top_k, count)
-        results = collection.query(
-            query_texts=[question],
-            n_results=n,
-            include=["documents", "metadatas", "distances"],
-        )
+        with quiet_macos():
+            results = collection.query(
+                query_texts=[question],
+                n_results=n,
+                include=["documents", "metadatas", "distances"],
+            )
 
         docs      = results["documents"][0]
         metadatas = results["metadatas"][0]
@@ -99,11 +101,12 @@ def learn_pattern(question: str, sql: str, log_id: int = None) -> None:
             # Deduplicate — skip if a very similar question already exists
             count = collection.count()
             if count > 0:
-                results = collection.query(
-                    query_texts=[question],
-                    n_results=1,
-                    include=["distances"],
-                )
+                with quiet_macos():
+                    results = collection.query(
+                        query_texts=[question],
+                        n_results=1,
+                        include=["distances"],
+                    )
                 if results["distances"][0]:
                     similarity = round(1 - results["distances"][0][0], 4)
                     if similarity >= 0.97:
@@ -114,11 +117,12 @@ def learn_pattern(question: str, sql: str, log_id: int = None) -> None:
                 doc_text = f'Question: "{question}"\n\nSQL:\n{sql}'
                 doc_id   = f"query_{abs(hash(question.lower().strip()))}"
 
-                collection.add(
-                    ids       = [doc_id],
-                    documents = [doc_text],
-                    metadatas = [{"question": question[:500], "feedback": ""}],
-                )
+                with quiet_macos():
+                    collection.add(
+                        ids       = [doc_id],
+                        documents = [doc_text],
+                        metadatas = [{"question": question[:500], "feedback": ""}],
+                    )
 
                 # Backfill embedding_id on the interaction log row
                 if log_id:

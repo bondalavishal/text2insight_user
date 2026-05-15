@@ -16,6 +16,11 @@ _ts = lambda: datetime.now().strftime("%H:%M:%S")
 
 TABLE = "default.text2insight_user_query_log"
 
+# ── DDL: run once in Databricks for any columns that do not exist yet ───────────
+# ALTER TABLE default.text2insight_user_query_log ADD COLUMN viz_spec_json STRING;
+# ALTER TABLE default.text2insight_user_query_log ADD COLUMN explain_text   STRING;
+# ────────────────────────────────────────────────────────────────────────────────
+
 
 def get_user_info(client, user_id: str) -> dict:
     try:
@@ -55,6 +60,8 @@ def log_interaction(
     spellcheck_applied:      bool  = False,
     corrected_prompt:        str   = None,
     embedding_id:            str   = None,
+    viz_spec_json:           str   = None,  # serialised VizSpec — enables chart regen on cache hit
+    explain_text:            str   = None,  # structured business analysis — served on cache hits
 ) -> int | None:
 
     def esc(s):
@@ -80,7 +87,7 @@ def log_interaction(
         similarity_matched_id, similarity_score, self_learned,
         success_signal,
         latency_ms, rows_returned, anomaly_count, cached,
-        embedding_id
+        embedding_id, viz_spec_json, explain_text
     ) VALUES (
         CURRENT_TIMESTAMP(),
         {sql_str(user_id)},
@@ -107,7 +114,9 @@ def log_interaction(
         {sql_int(rows_returned)},
         {sql_int(anomaly_count)},
         {sql_bool(cached)},
-        {sql_str(embedding_id)}
+        {sql_str(embedding_id)},
+        {sql_str(viz_spec_json)},
+        {sql_str(explain_text)}
     )
     """
     try:

@@ -48,7 +48,7 @@ DOWNLOAD_FOOTER = (
 )
 
 # ── Explain trigger words ─────────────────────────────────────────────────────
-EXPLAIN_TRIGGERS = ["explain", "deep dive", "breakdown", "analyse this", "analyze this", "tell me more"]
+EXPLAIN_TRIGGERS = ["explain", "deep dive", "analyse this", "analyze this", "tell me more"]
 
 # ── Pre-flight unanswerable patterns ─────────────────────────────────────────
 UNANSWERABLE_PATTERNS = [
@@ -66,7 +66,7 @@ STATS_PATTERN = re.compile(
 # ── Download trigger words ────────────────────────────────────────────────────
 # "download" is shown to users in the footer
 # others are god-mode silent triggers for dev/prod
-DOWNLOAD_TRIGGERS = ["download", "csv", "export", "give me the data"]
+DOWNLOAD_TRIGGERS = ["download", "csv", "give me the data"]
 
 # ── Anomaly thresholds ────────────────────────────────────────────────────────
 DELIVERY_THRESHOLD     = 20.0
@@ -85,14 +85,20 @@ _PADDING = [
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def is_download_request(text: str) -> bool:
-    """Returns True if the message is a download/csv/export request."""
+    """Returns True if the message is a download/csv/export request.
+    Hard cap at 40 chars — download commands are short; data questions are not."""
     t = text.lower().strip()
+    if len(t) > 40:
+        return False
     return any(trigger in t for trigger in DOWNLOAD_TRIGGERS)
 
 
 def is_explain_request(text: str) -> bool:
-    """Returns True if the message is a request for a deep-dive explanation."""
+    """Returns True if the message is a request for a deep-dive explanation.
+    Hard cap at 40 chars — explain commands are short; data questions are not."""
     t = text.lower().strip()
+    if len(t) > 40:
+        return False
     return any(trigger in t for trigger in EXPLAIN_TRIGGERS)
 
 
@@ -444,7 +450,12 @@ def _split_questions(text: str) -> list[str]:
     lines = [l.strip() for l in text.split('\n')
              if l.strip() and len(l.strip()) > 10]
     if len(lines) > 1: return lines
-    parts = [p.strip()+"?" for p in re.split(r'\?\s+', text)
-             if p.strip() and len(p.strip()) > 10]
-    if len(parts) > 1: return parts
+    # Only split on '?' when there are 3+ question marks — 2 is common in a
+    # single analytical question with a follow-up sub-question (e.g. "...bucket
+    # into X? Which bucket has the highest...?").  Users wanting exactly 2
+    # separate questions should number them or put each on its own line.
+    if text.count('?') >= 3:
+        parts = [p.strip().rstrip("?")+"?" for p in re.split(r'\?\s+', text)
+                 if p.strip() and len(p.strip()) > 10]
+        if len(parts) > 1: return parts
     return [text.strip()]

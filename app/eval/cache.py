@@ -8,12 +8,19 @@ No expiry — dataset is static (Olist 2016-2018).
 import os
 import re
 import time
-import chromadb
+import logging
 from datetime import datetime
 
-_ts = lambda: datetime.now().strftime("%H:%M:%S")
+import chromadb
 from chromadb.utils import embedding_functions
+
 from app.sql.connector import run_query
+from app.utils import quiet_macos
+
+# Suppress ChromaDB's noisy telemetry and internal warnings
+logging.getLogger("chromadb").setLevel(logging.CRITICAL)
+
+_ts = lambda: datetime.now().strftime("%H:%M:%S")
 
 _NUMBERS_RE = re.compile(r'\b\d+\b')
 
@@ -97,11 +104,12 @@ def get_cached(question: str) -> dict | None:
         if collection.count() == 0:
             return None
 
-        results = collection.query(
-            query_texts=[question],
-            n_results=1,
-            include=["documents", "metadatas", "distances"],
-        )
+        with quiet_macos():
+            results = collection.query(
+                query_texts=[question],
+                n_results=1,
+                include=["documents", "metadatas", "distances"],
+            )
 
         if not results["documents"][0]:
             return None
@@ -136,6 +144,8 @@ def get_cached(question: str) -> dict | None:
                 "sql":                   meta.get("sql", ""),
                 "csv_string":            meta.get("csv_string", ""),
                 "result_json":           meta.get("result_json", ""),
+                "viz_spec_json":         meta.get("viz_spec_json", ""),
+                "explain_text":          meta.get("explain_text", ""),
                 "similarity":            similarity,
                 "similarity_matched_id": int(raw_log_id) if raw_log_id else None,
             }
@@ -148,10 +158,23 @@ def get_cached(question: str) -> dict | None:
         return None
 
 
-def save_to_cache(question: str, answer: str, sql: str, csv_string: str = "", result_json: str = "") -> None:
+def save_to_cache(
+    question: str,
+    answer: str,
+    sql: str,
+    csv_string: str = "",
+    result_json: str = "",
+    viz_spec_json: str = "",
+    explain_text: str = "",
+) -> None:
     """
-    Save a question+answer pair to the cache, including the CSV and raw
-    result_json so that cache hits can re-run anomaly detection dynamically.
+    Save a question+answer pair to the cache.
+
+    Stores result_json so cache hits can re-run anomaly detection dynamically.
+    Stores viz_spec_json (serialised VizSpec) so cache hits can regenerate the
+    chart image without calling the LLM classifier again (~40 ms vs ~1–2 s).
+    Stores explain_text (structured business analysis) so cache hits can serve
+    the full one-shot response without calling the LLM again.
     """
     try:
         collection = _get_collection()
@@ -163,13 +186,16 @@ def save_to_cache(question: str, answer: str, sql: str, csv_string: str = "", re
         except Exception:
             pass
 
-        collection.add(
-            ids       = [cache_id],
-            documents = [question],
-            metadatas = [{"answer": answer, "sql": sql,
-                          "csv_string": csv_string, "result_json": result_json or "",
-                          "cached_at": str(time.time())}],
-        )
+        with quiet_macos():
+            collection.add(
+                ids       = [cache_id],
+                documents = [question],
+                metadatas = [{"answer": answer, "sql": sql,
+                              "csv_string": csv_string, "result_json": result_json or "",
+                              "viz_spec_json": viz_spec_json or "",
+                              "explain_text": explain_text or "",
+                              "cached_at": str(time.time())}],
+            )
         print(f"{_ts()} [Cache] Saved: {question[:60]}...")
 
     except Exception as e:
