@@ -9,3 +9,4 @@ pandas>=1.2.5,<2.2.0
 python-dotenv==1.0.1
 cerebras-cloud-sdk==1.67.0
 pyspellchecker==0.8.1
+matplotlib>=3.7.0

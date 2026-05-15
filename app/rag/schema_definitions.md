@@ -208,6 +208,9 @@ FROM olist_order_payments;
 - category (English) only in vw_product_metrics
 - For raw category names: join olist_products → product_category_translation on product_category_name
 - seller_id in both vw_seller_metrics (aggregated) and olist_order_items (raw)
+- olist_orders has NO order_date column — use order_purchase_timestamp (TIMESTAMP) for date arithmetic on raw tables, or join vw_orders_metrics to get the pre-cast order_date DATE
+- olist_order_payments has NO customer_id column — to get customer_id join to olist_orders first
+- customer_id in olist_orders is per-ORDER not per-PERSON — a returning customer gets a NEW customer_id each order. ALWAYS join olist_customers and use customer_unique_id to identify repeat customers. GROUP BY o.customer_id for repeat analysis will give every count=1
 
 ## Raw table join patterns
 
@@ -225,6 +228,53 @@ JOIN olist_products p ON i.product_id = p.product_id
 JOIN product_category_translation t ON p.product_category_name = t.product_category_name
 GROUP BY t.product_category_name_english
 ORDER BY cancel_pct DESC LIMIT 10;
+```
+
+### Repeat-customer analysis (MUST use customer_unique_id):
+```sql
+-- customer_id in olist_orders is per-order. Use customer_unique_id from
+-- olist_customers to track the same person across multiple orders.
+WITH customer_orders AS (
+    SELECT c.customer_unique_id,
+        COUNT(DISTINCT o.order_id)              AS order_count,
+        MIN(o.order_purchase_timestamp)         AS first_order_ts,
+        MAX(o.order_purchase_timestamp)         AS last_order_ts
+    FROM olist_orders o
+    JOIN olist_customers c ON o.customer_id = c.customer_id
+    GROUP BY c.customer_unique_id
+)
+SELECT order_count, COUNT(*) AS num_customers
+FROM customer_orders
+GROUP BY order_count
+ORDER BY order_count LIMIT 10;
+```
+
+### Customer-level payment analysis (olist_order_payments has NO customer_id):
+```sql
+-- Bring customer_id in via olist_orders, then aggregate payment behaviour.
+WITH payment_orders AS (
+    SELECT o.customer_id,
+        op.payment_type,
+        op.payment_installments,
+        SUM(op.payment_value) AS order_value
+    FROM olist_orders o
+    JOIN olist_order_payments op ON o.order_id = op.order_id
+    GROUP BY o.customer_id, op.payment_type, op.payment_installments
+),
+lifetime AS (
+    SELECT customer_id,
+        CASE WHEN payment_type = 'credit_card' AND payment_installments > 3
+             THEN 'credit_multi' ELSE 'single_or_other' END AS pay_group,
+        SUM(order_value) AS lifetime_gmv,
+        COUNT(*) AS order_count
+    FROM payment_orders
+    GROUP BY customer_id, pay_group
+)
+SELECT pay_group,
+    ROUND(AVG(lifetime_gmv), 2) AS avg_lifetime_gmv,
+    ROUND(AVG(order_count), 2)  AS avg_order_count
+FROM lifetime
+GROUP BY pay_group LIMIT 10;
 ```
 
 ### Multi-view monthly anomaly detection (revenue + cancellation + TAT):
