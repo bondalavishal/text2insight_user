@@ -121,7 +121,7 @@ def learn_pattern(question: str, sql: str, log_id: int = None) -> None:
                     collection.add(
                         ids       = [doc_id],
                         documents = [doc_text],
-                        metadatas = [{"question": question[:500], "feedback": ""}],
+                        metadatas = [{"question": question, "feedback": ""}],
                     )
 
                 # Backfill embedding_id on the interaction log row

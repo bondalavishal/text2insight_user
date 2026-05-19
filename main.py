@@ -21,11 +21,11 @@ from app.slack.handler import (
     _generate_sql_with_overrides,
     _split_questions,
     detect_anomalies,
-    summarise_results,
+    summarise_and_explain,
+    generate_explanation,   # used for cache-hit explain backfill only
     # is_download_request, is_explain_request — kept for re-enable with manual handlers
     is_download_request,
     is_explain_request,
-    generate_explanation,
     results_to_csv_string,
     STATS_PATTERN,
     get_stats,
@@ -54,6 +54,7 @@ app = App(token=os.getenv("SLACK_BOT_TOKEN"))
 # ── In-memory store: last results per user ────────────────────────────────────
 # { user_id: { "results": [...], "csv_string": "...", "log_id": 123, "question": "..." } }
 _last_interaction: dict = {}
+_last_interaction_lock = threading.Lock()
 
 
 # ── Progress bar ──────────────────────────────────────────────────────────────
@@ -123,7 +124,7 @@ def _answer_with_progress(
                 if vsp_json:
                     try:
                         spec = VizSpec(**json.loads(vsp_json))
-                        chart_bytes = generate_chart(question, cached_results, spec)
+                        chart_bytes = generate_chart(question, cached_results, spec, use_codegen=False)
                         if chart_bytes:
                             print(f"{_ts()} [Chart] Cache-hit regen OK ({len(chart_bytes)//1024}KB)")
                     except Exception as _ce:
@@ -131,13 +132,77 @@ def _answer_with_progress(
         except Exception:
             pass
 
+        # ── If result_json is absent, re-run the cached SQL to get raw data ───
+        # Without rows we can't regenerate CSV / chart / explain — so always
+        # ensure we have data before attempting to fill missing deliverables.
+        result_json_c = cached_entry.get("result_json", "") or ""
+        if not cached_results and cached_entry.get("sql"):
+            try:
+                cached_results = run_query(cached_entry["sql"])
+                if cached_results:
+                    result_json_c = results_to_json_string(cached_results) or ""
+                    flags_rerun   = detect_anomalies(question, cached_results)
+                    if flags_rerun:
+                        cached_answer  = cached_answer + "\n" + "\n".join(flags_rerun)
+                        anomaly_count  = len(flags_rerun)
+                    print(f"{_ts()} [Cache] Re-ran SQL for missing result_json ({len(cached_results)} rows)")
+            except Exception as _qe:
+                print(f"{_ts()} [Cache] SQL re-run failed: {_qe}")
+
+        # ── Fill missing deliverables (csv / chart / explain) ─────────────────
+        # Regenerate any that are absent, then backfill into cache so future
+        # hits get everything instantly without re-running SQL or the LLM.
+        csv_string_c    = cached_entry.get("csv_string", "") or ""
+        explain_text_c  = cached_entry.get("explain_text", "") or ""
+        _new_vsp_json   = None
+        _needs_backfill = bool(result_json_c and not (cached_entry.get("result_json") or ""))
+
+        if cached_results:
+            if not csv_string_c:
+                csv_string_c    = results_to_csv_string(cached_results)
+                _needs_backfill = True
+
+            if not chart_bytes:
+                try:
+                    spec = classify_viz(question, cached_results)
+                    if spec:
+                        chart_bytes   = generate_chart(question, cached_results, spec, use_codegen=False)
+                        _new_vsp_json = json.dumps(
+                            {k: v for k, v in spec.__dict__.items()}, default=str
+                        )
+                        _needs_backfill = True
+                        if chart_bytes:
+                            print(f"{_ts()} [Chart] Cache-hit classify regen OK ({len(chart_bytes)//1024}KB)")
+                except Exception as _ce:
+                    print(f"{_ts()} [Chart] Cache-hit classify regen failed: {_ce}")
+
+            if not explain_text_c:
+                try:
+                    explain_text_c = generate_explanation(question, cached_results) or ""
+                    if explain_text_c:
+                        _needs_backfill = True
+                        print(f"{_ts()} [Cache] Regenerated explain_text for: {question[:60]}...")
+                except Exception as _ee:
+                    print(f"{_ts()} [Cache] explain_text regen failed: {_ee}")
+
+            if _needs_backfill:
+                save_to_cache(
+                    question,
+                    cached_entry["answer"],
+                    cached_entry["sql"],
+                    csv_string_c,
+                    result_json_c,
+                    _new_vsp_json or cached_entry.get("viz_spec_json", ""),
+                    explain_text_c,
+                )
+
         log(question=question, sql=cached_entry["sql"], rows_returned=0,
             latency_ms=latency_ms, cached=True, status="cache_hit")
         result.update(
             reply=f"{prefix}{cached_answer}",
             results=cached_results,
-            result_json=cached_entry.get("result_json", ""),
-            csv_string=cached_entry.get("csv_string", ""),
+            result_json=result_json_c,
+            csv_string=csv_string_c,
             status="cache_hit",
             sql=cached_entry["sql"],
             latency_ms=latency_ms,
@@ -146,7 +211,7 @@ def _answer_with_progress(
             chart_bytes=chart_bytes,
             similarity_matched_id=cached_entry.get("similarity_matched_id"),
             similarity_score=cached_entry.get("similarity"),
-            explain_text=cached_entry.get("explain_text", ""),
+            explain_text=explain_text_c,
         )
         return result
 
@@ -177,6 +242,8 @@ def _answer_with_progress(
     is_valid, reason, failure_type = validate_sql(sql)
     if not is_valid:
         latency_ms = int((time.time() - start) * 1000)
+        print(f"{_ts()} [Guardrail] FAILED ({failure_type}): {reason}")
+        print(f"{_ts()} [Guardrail] Rejected SQL:\n{sql}")
         status_map = {
             "blocked_keyword":   "blocked",
             "disallowed_source": "disallowed_source",
@@ -189,6 +256,19 @@ def _answer_with_progress(
             reply=f"{prefix}Couldn't generate a safe query — try rephrasing.",
             status=guard_status,
             failure_reason=reason,
+            latency_ms=latency_ms,
+        )
+        return result
+
+    # ── LLM "cannot answer" sentinel — return before guardrails ──────────────
+    if re.search(r"cannot be answered", sql, re.IGNORECASE):
+        latency_ms = int((time.time() - start) * 1000)
+        log(question=question, sql=sql, latency_ms=latency_ms,
+            status="blocked", failure_reason="unanswerable")
+        result.update(
+            reply=f"{prefix}I don't have the data to answer that — try rephrasing or ask something about orders, revenue, sellers, products or delivery.",
+            status="blocked",
+            failure_reason="unanswerable",
             latency_ms=latency_ms,
         )
         return result
@@ -219,15 +299,10 @@ def _answer_with_progress(
                        text=_progress_bar(80, "Detecting anomalies"))
     flags = detect_anomalies(question, results)
 
-    # ── Summarise (88%) ───────────────────────────────────────────────────────
+    # ── Summary + Explain in one LLM call (90%) ──────────────────────────────
     client.chat_update(channel=channel, ts=ts,
-                       text=_progress_bar(88, "Summarising results"))
-    summary = summarise_results(question, results)
-
-    # ── Explain (95%) — structured business analysis ──────────────────────────
-    client.chat_update(channel=channel, ts=ts,
-                       text=_progress_bar(95, "Generating analysis"))
-    explain_text = generate_explanation(question, results)
+                       text=_progress_bar(90, "Analysing results"))
+    summary, explain_text = summarise_and_explain(question, results)
 
     # ── Build reply (summary + anomaly flags; explain posted separately) ──────
     reply = f"{prefix}{summary}"
@@ -316,6 +391,14 @@ def _deliver(
             )
         except Exception as _e:
             print(f"{_ts()} [Chart] {q_label+' ' if q_label else ''}upload failed: {_e}")
+    elif r.get("status") in ("success", "cache_hit"):
+        try:
+            client.chat_postMessage(
+                channel=channel,
+                text=f"<@{user}> _Couldn't render a chart for this query._",
+            )
+        except Exception:
+            pass
 
     # 4. Explain post
     if r.get("explain_text"):
@@ -372,7 +455,8 @@ def process_message(client, user: str, text: str, channel: str):
         spellcheck_applied = True
         print(f"{_ts()} [text2insight] Spellcheck applied: '{raw_prompt}' → '{text}'")
 
-    last = _last_interaction.get(user)
+    with _last_interaction_lock:
+        last = _last_interaction.get(user)
 
     # ── Pending-batch number selection ────────────────────────────────────────
     # When all questions in a multi-question batch hit the cache, Q1 is answered
@@ -422,13 +506,14 @@ def process_message(client, user: str, text: str, channel: str):
             _deliver(client, user, channel, batch_q, r_b, ts_b, q_label=f"Q{choice}")
 
             # Preserve pending_batch so other numbers can still be requested
-            _last_interaction[user] = {
-                **last,
-                "results":    r_b.get("results", []),
-                "csv_string": r_b["csv_string"],
-                "log_id":     b_log_id,
-                "question":   batch_q,
-            }
+            with _last_interaction_lock:
+                _last_interaction[user] = {
+                    **last,
+                    "results":    r_b.get("results", []),
+                    "csv_string": r_b["csv_string"],
+                    "log_id":     b_log_id,
+                    "question":   batch_q,
+                }
             print(f"{_ts()} [text2insight] Pending-batch Q{choice} served for user={user}")
             return
         # Number out of range — fall through to normal pipeline
@@ -688,16 +773,17 @@ def process_message(client, user: str, text: str, channel: str):
         if r["status"] == "success" and log_id and r["sql"]:
             learn_pattern(questions[0], r["sql"], log_id)
 
-        _last_interaction[user] = {
-            "results":      r["results"],
-            "csv_string":   r["csv_string"],
-            "log_id":       log_id,
-            "question":     questions[0],
-            "csv_files":    [{"csv_string": r["csv_string"], "question": questions[0], "log_id": log_id}]
-                            if r["csv_string"] else [],
-            "explain_items": [{"results": r["results"], "question": questions[0]}]
-                             if r["results"] else [],
-        }
+        with _last_interaction_lock:
+            _last_interaction[user] = {
+                "results":      r["results"],
+                "csv_string":   r["csv_string"],
+                "log_id":       log_id,
+                "question":     questions[0],
+                "csv_files":    [{"csv_string": r["csv_string"], "question": questions[0], "log_id": log_id}]
+                                if r["csv_string"] else [],
+                "explain_items": [{"results": r["results"], "question": questions[0]}]
+                                 if r["results"] else [],
+            }
 
         # One-shot delivery: summary → CSV → chart → explain
         _deliver(client, user, channel, questions[0], r, ts)
@@ -765,17 +851,18 @@ def process_message(client, user: str, text: str, channel: str):
                 )
             )
 
-            _last_interaction[user] = {
-                "results":      r1.get("results", []),
-                "csv_string":   r1["csv_string"],
-                "log_id":       log_id1,
-                "question":     q1,
-                "csv_files":    [{"csv_string": r1["csv_string"], "question": q1, "log_id": log_id1}]
-                                if r1["csv_string"] else [],
-                "explain_items": [{"results": r1.get("results", []), "question": q1}]
-                                 if r1.get("results") else [],
-                "pending_batch": [{"question": q} for q in questions[1:]],
-            }
+            with _last_interaction_lock:
+                _last_interaction[user] = {
+                    "results":      r1.get("results", []),
+                    "csv_string":   r1["csv_string"],
+                    "log_id":       log_id1,
+                    "question":     q1,
+                    "csv_files":    [{"csv_string": r1["csv_string"], "question": q1, "log_id": log_id1}]
+                                    if r1["csv_string"] else [],
+                    "explain_items": [{"results": r1.get("results", []), "question": q1}]
+                                     if r1.get("results") else [],
+                    "pending_batch": [{"question": q} for q in questions[1:]],
+                }
             return
 
         # ── Normal parallel execution ─────────────────────────────────────────
@@ -865,14 +952,15 @@ def process_message(client, user: str, text: str, channel: str):
              for idx in range(len(ordered_results) - 1, -1, -1)
              if ordered_results[idx] and ordered_results[idx].get("results")), []
         )
-        _last_interaction[user] = {
-            "results":       _last_results_early,
-            "csv_string":    csv_files[-1]["csv_string"] if csv_files else "",
-            "log_id":        None,
-            "question":      _last_question_early,
-            "csv_files":     csv_files,
-            "explain_items": explain_items_early,
-        }
+        with _last_interaction_lock:
+            _last_interaction[user] = {
+                "results":       _last_results_early,
+                "csv_string":    csv_files[-1]["csv_string"] if csv_files else "",
+                "log_id":        None,
+                "question":      _last_question_early,
+                "csv_files":     csv_files,
+                "explain_items": explain_items_early,
+            }
 
         # Phase 2 — deliver CSV + chart + explain in original question order,
         # then log each interaction.  Summaries were already shown in Phase 1.
@@ -905,6 +993,14 @@ def process_message(client, user: str, text: str, channel: str):
                     )
                 except Exception as _e:
                     print(f"{_ts()} [Chart] Q{idx+1} upload failed: {_e}")
+            elif r.get("status") in ("success", "cache_hit"):
+                try:
+                    client.chat_postMessage(
+                        channel=channel,
+                        text=f"<@{user}> _Q{idx+1}: Couldn't render a chart for this query._",
+                    )
+                except Exception:
+                    pass
 
             # 2c. Post explain analysis
             if r.get("explain_text"):
@@ -948,15 +1044,16 @@ def process_message(client, user: str, text: str, channel: str):
             if r["status"] == "success" and log_id and r["sql"]:
                 learn_pattern(q, r["sql"], log_id)
 
-            if r["csv_string"] and log_id:
-                for cf in _last_interaction[user]["csv_files"]:
-                    if cf["question"] == q and cf["log_id"] is None:
-                        cf["log_id"] = log_id
-                        break
+            with _last_interaction_lock:
+                if r["csv_string"] and log_id:
+                    for cf in _last_interaction[user]["csv_files"]:
+                        if cf["question"] == q and cf["log_id"] is None:
+                            cf["log_id"] = log_id
+                            break
 
-            if r["results"] or r["csv_string"]:
-                _last_interaction[user]["log_id"]  = log_id
-                _last_interaction[user]["question"] = q
+                if r["results"] or r["csv_string"]:
+                    _last_interaction[user]["log_id"]  = log_id
+                    _last_interaction[user]["question"] = q
 
 
 # ── Slack event handlers ──────────────────────────────────────────────────────

@@ -42,11 +42,6 @@ _OPENROUTER_SUMMARY_MODELS = [
     "nousresearch/hermes-3-llama-3.1-405b:free",
 ]
 
-DOWNLOAD_FOOTER = (
-    "\n\n💾 *Want the full data?* Reply with *download* to get a CSV."
-    "\n🔍 *Want a deeper breakdown?* Reply with *explain* for a detailed analysis."
-)
-
 # ── Explain trigger words ─────────────────────────────────────────────────────
 EXPLAIN_TRIGGERS = ["explain", "deep dive", "analyse this", "analyze this", "tell me more"]
 
@@ -150,10 +145,7 @@ def generate_explanation(question: str, results: list[dict]) -> str:
     if not results:
         return "No data available to explain."
 
-    sample       = results[:50]
-    results_text = "\n".join(str(r) for r in sample)
-    if len(results) > 50:
-        results_text += f"\n... ({len(results) - 50} more rows not shown)"
+    results_text = "\n".join(str(r) for r in results)
 
     prompt = EXPLAIN_PROMPT.format(
         question=question,
@@ -169,7 +161,6 @@ def generate_explanation(question: str, results: list[dict]) -> str:
                 model=CEREBRAS_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
-                max_tokens=600,
             ).choices[0].message.content.strip()
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
@@ -194,7 +185,7 @@ def generate_explanation(question: str, results: list[dict]) -> str:
                     _GROQ_URL,
                     headers={"Authorization": f"Bearer {_GROQ_API_KEY}", "Content-Type": "application/json"},
                     json={"model": model, "messages": [{"role": "user", "content": prompt}],
-                          "temperature": 0, "max_tokens": 600},
+                          "temperature": 0},
                     timeout=30,
                 )
                 if r.status_code in (429, 413):
@@ -217,7 +208,7 @@ def generate_explanation(question: str, results: list[dict]) -> str:
                              "HTTP-Referer": "https://text2insight.app",
                              "X-Title": "text2insight"},
                     json={"model": model, "messages": [{"role": "user", "content": prompt}],
-                          "temperature": 0, "max_tokens": 600},
+                          "temperature": 0},
                     timeout=45,
                 )
                 if r.status_code == 429:
@@ -235,13 +226,181 @@ def generate_explanation(question: str, results: list[dict]) -> str:
             "model":   OLLAMA_MODEL,
             "prompt":  prompt,
             "stream":  False,
-            "options": {"temperature": 0, "num_predict": 600}
+            "options": {"temperature": 0, "num_predict": -1}
         }, timeout=120)
         print(f"{_ts()} [LLM] Explanation via Ollama (last resort)")
         return response.json()["response"].strip()
     except Exception as e:
         print(f"{_ts()} [LLM] Ollama explain also failed ({e})")
         return "Explanation unavailable — see the data above."
+
+
+_COMBINED_PROMPT = """You are a senior business analytics assistant.
+
+The user asked: {question}
+
+Full dataset ({row_count} rows):
+{results}
+
+Produce TWO outputs in EXACTLY this format — no deviation, no extra text outside the delimiters:
+
+===SUMMARY===
+2–3 sentence executive answer. State the dominant finding with specific numbers. No filler, no disclaimers.
+
+===ANALYSIS===
+*Overall Picture*
+2–3 sentences on what this data actually reveals. Do NOT restate the question. State the dominant pattern, gap, or trend.
+
+*Key Findings*
+• [Finding with specific number from the data]
+• [Finding with specific number from the data]
+• [Finding with specific number from the data]
+3–5 bullets. Each must cite a real number. Focus on the largest gaps, rankings, and contrasts.
+
+*Outliers & Anomalies*
+• [Outlier: name the data point, state the magnitude of deviation, give a plausible business reason]
+1–3 data points that deviate most from the norm.
+
+*Business Implications*
+2–3 sentences. Connect the pattern to a real business problem. Be specific about which segments are affected.
+
+*Recommended Actions*
+1. [Specific action naming the category/metric and the outcome to target]
+2. [Specific action]
+3. [Specific action]
+3–5 prioritized actions in first-person style ("Investigate...", "Prioritise...", "Consider...").
+
+Formatting rules:
+- Section headers: *bold* exactly as shown, never ##
+- Bullet points: use • for Key Findings and Outliers
+- Numbered list: 1. 2. 3. for Recommended Actions
+- Use actual numbers from the data only — never invent figures
+- Prefix R$ for monetary values, say 'days' for delivery
+- No disclaimers, no filler, no restating the question"""
+
+
+def _parse_combined(raw: str) -> tuple[str, str]:
+    """Extract (summary, analysis) from a combined LLM response."""
+    summary_m  = re.search(r'===SUMMARY===\s*(.*?)(?====ANALYSIS===)', raw, re.DOTALL)
+    analysis_m = re.search(r'===ANALYSIS===\s*(.*?)$', raw, re.DOTALL)
+    summary  = _clean_summary(summary_m.group(1).strip()) if summary_m else ""
+    analysis = analysis_m.group(1).strip() if analysis_m else ""
+    return summary, analysis
+
+
+def summarise_and_explain(question: str, results: list[dict]) -> tuple[str, str]:
+    """
+    Single LLM call returning (summary, explain_text).
+    Replaces separate summarise_results() + generate_explanation() calls.
+    Falls back to the individual functions if the combined call fails or
+    the response doesn't contain both delimiters.
+    """
+    if not results:
+        return "The query returned no results.", ""
+
+    results_text = "\n".join(str(r) for r in results)
+    prompt = _COMBINED_PROMPT.format(
+        question=question,
+        row_count=len(results),
+        results=results_text,
+    )
+
+    raw: str = ""
+
+    # 1. Cerebras
+    _TIMEOUT = 25
+    if not is_open():
+        def _cerebras_combined():
+            return _cerebras_client.chat.completions.create(
+                model=CEREBRAS_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+            ).choices[0].message.content.strip()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                raw = ex.submit(_cerebras_combined).result(timeout=_TIMEOUT)
+            record_success()
+            print(f"{_ts()} [LLM] Summary+Explain via Cerebras")
+        except concurrent.futures.TimeoutError:
+            record_failure()
+            print(f"{_ts()} [LLM] Cerebras combined timed out — trying Groq")
+        except Exception as e:
+            record_failure()
+            print(f"{_ts()} [LLM] Cerebras combined failed ({e}) — trying Groq")
+    else:
+        print(f"{_ts()} [LLM] Cerebras circuit open — skipping to Groq")
+
+    # 2. Groq
+    if not raw and _GROQ_API_KEY:
+        for model in _GROQ_SUMMARY_MODELS:
+            try:
+                r = httpx.post(
+                    _GROQ_URL,
+                    headers={"Authorization": f"Bearer {_GROQ_API_KEY}",
+                             "Content-Type": "application/json"},
+                    json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                          "temperature": 0},
+                    timeout=45,
+                )
+                if r.status_code in (429, 413):
+                    print(f"{_ts()} [LLM] Groq {model} skipped ({r.status_code}) — next model")
+                    continue
+                r.raise_for_status()
+                raw = r.json()["choices"][0]["message"]["content"].strip()
+                print(f"{_ts()} [LLM] Summary+Explain via Groq ({model})")
+                break
+            except Exception as ex:
+                print(f"{_ts()} [LLM] Groq {model} failed ({ex}) — next model")
+
+    # 3. OpenRouter
+    if not raw and _OPENROUTER_API_KEY:
+        for model in _OPENROUTER_SUMMARY_MODELS:
+            try:
+                r = httpx.post(
+                    _OPENROUTER_URL,
+                    headers={"Authorization": f"Bearer {_OPENROUTER_API_KEY}",
+                             "Content-Type": "application/json",
+                             "HTTP-Referer": "https://text2insight.app",
+                             "X-Title": "text2insight"},
+                    json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                          "temperature": 0},
+                    timeout=60,
+                )
+                if r.status_code == 429:
+                    print(f"{_ts()} [LLM] OpenRouter {model} rate-limited — next model")
+                    continue
+                r.raise_for_status()
+                raw = r.json()["choices"][0]["message"]["content"].strip()
+                print(f"{_ts()} [LLM] Summary+Explain via OpenRouter ({model})")
+                break
+            except Exception as ex:
+                print(f"{_ts()} [LLM] OpenRouter {model} failed ({ex}) — next model")
+
+    # 4. Ollama
+    if not raw:
+        try:
+            resp = httpx.post(OLLAMA_URL, json={
+                "model": OLLAMA_MODEL, "prompt": prompt,
+                "stream": False, "options": {"temperature": 0, "num_predict": -1},
+            }, timeout=120)
+            raw = resp.json()["response"].strip()
+            print(f"{_ts()} [LLM] Summary+Explain via Ollama (last resort)")
+        except Exception as e:
+            print(f"{_ts()} [LLM] All providers failed ({e})")
+
+    if raw:
+        summary, analysis = _parse_combined(raw)
+        if summary and analysis:
+            return summary, analysis
+        # LLM responded but didn't use delimiters — treat whole response as analysis,
+        # fall through to summarise_results() for the short summary
+        print(f"{_ts()} [LLM] Combined response missing delimiters — extracting summary separately")
+        if analysis:
+            return summarise_results(question, results), analysis
+
+    # Full fallback: separate calls
+    print(f"{_ts()} [LLM] Combined call failed — falling back to separate calls")
+    return summarise_results(question, results), generate_explanation(question, results)
 
 
 def results_to_csv_string(results: list[dict]) -> str:
@@ -280,7 +439,8 @@ def detect_anomalies(question: str, results: list[dict]) -> list[str]:
                     flags.append(
                         f"⚠️ *Anomaly:* {state} avg delivery is {row.get(col)} days"
                         f" — exceeds {int(DELIVERY_THRESHOLD)}-day threshold.")
-            except: pass
+            except (TypeError, ValueError):
+                pass
 
     for col in [k for k in keys if "cancel" in k.lower() and
                 any(w in k.lower() for w in ["pct", "rate", "percent"])]:
@@ -292,7 +452,8 @@ def detect_anomalies(question: str, results: list[dict]) -> list[str]:
                     flags.append(
                         f"⚠️ *Anomaly:* Cancellation rate{f' in {p}' if p else ''}"
                         f" is {round(fval,1)}% — exceeds {int(CANCEL_THRESHOLD)}%.")
-            except: pass
+            except (TypeError, ValueError):
+                pass
 
     for col in [k for k in keys if any(w in k.lower()
                 for w in ["growth", "pct", "drop", "mom", "change"])]:
@@ -305,7 +466,8 @@ def detect_anomalies(question: str, results: list[dict]) -> list[str]:
                         f"⚠️ *Anomaly:* Revenue dropped {abs(round(fval,1))}%"
                         f"{f' in {p}' if p else ''}"
                         f" — exceeds {int(REVENUE_DROP_THRESHOLD)}% threshold.")
-            except: pass
+            except (TypeError, ValueError):
+                pass
 
     if (any(k for k in keys if "review" in k.lower() and "score" in k.lower())
             and ("seller" in q or "review" in q)):
@@ -318,7 +480,8 @@ def detect_anomalies(question: str, results: list[dict]) -> list[str]:
                     flags.append(
                         f"⚠️ *Anomaly:* Seller{f' ({s[:8]}...)' if s else ''}"
                         f" review is {round(fval,2)} — below {REVIEW_THRESHOLD}.")
-            except: pass
+            except (TypeError, ValueError):
+                pass
 
     seen, unique = set(), []
     for f in flags:

@@ -108,7 +108,9 @@ _ABBREVIATIONS = {
     "cnt":   "count",
     "pct":   "percent",
     "num":   "number",
-    "no":    "number",     # "no of orders" → "number of orders"
+    # NOTE: "no" intentionally removed — "no cancellations / no reviews / no data"
+    # would expand to "number cancellations / number reviews / number data" which
+    # breaks the LLM's understanding. Use "num" or "number" instead.
     "qty":   "quantity",
     "val":   "value",
     "diff":  "difference",
@@ -148,10 +150,37 @@ _DOMAIN_WORDS = {
     "pareto", "quartile", "quartiles", "percentile", "percentiles",
     "cohort", "cohorts", "histogram", "heatmap", "funnel",
     "decile", "deciles", "outlier", "outliers",
+    # Chart / viz type names — pyspellchecker mangles these
+    # sankey→sake, treemap→treetop, boxplot→complot, scatterplot→scattershot
+    # barchart→bacchant, piechart→pilchard, kde→de
+    "sankey", "treemap", "boxplot", "scatterplot", "barchart", "piechart", "kde",
+    "waterfall", "choropleth", "sunburst", "candlestick", "violin",
+    "scatter", "bubble", "stacked", "grouped", "clustered",
+    # Analytics / statistics terms — lorenz→lore, gini→gin
+    "lorenz", "gini", "rfm",
+    # E-commerce / ops — geolocation→relocation, dropoff→dropout
+    "geolocation", "dropoff", "dropoffs", "fulfillment", "installment", "installments",
+    # Month names — pyspellchecker mangles these (e.g. January → Canary)
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+    # Day names
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    # Common time / filter words that get mangled
+    "through", "between", "from", "until", "since", "before", "after",
+    "cumulative", "running", "trailing", "rolling",
+    "quarterly", "annually", "weekly", "monthly", "daily",
+    "seasonal", "seasonality", "trending", "historical", "forecast",
+    # Brazilian geography — paulo→pull, bahia→basic, ceara→hear, goias→glias
+    "paulo", "gerais", "bahia", "ceara", "goias", "parana",
+    "midwest", "southeast", "northeast", "northwest", "southwest",
+    # Common analytics question words that could be mangled
+    "correlation", "segmentation", "decomposition", "attribution",
+    "retention", "attrition", "conversion", "benchmark", "baseline",
+    "marginal", "incremental", "normalized", "aggregated",
 }
 _spell.word_frequency.load_words(_DOMAIN_WORDS)
 
-# Numeric/symbolic shorthand
+# Numeric/symbolic shorthand — manual overrides for typos pyspellchecker gets wrong
 _NUMERIC_SHORTHAND = {
     "b4":     "before",
     "averg":  "average",
@@ -160,6 +189,13 @@ _NUMERIC_SHORTHAND = {
     "dlvry":  "delivery",
     "revenu": "revenue",
     "reveneu":"revenue",
+    "sellr":  "seller",    # pyspellchecker: sellr→sell (wrong); correct→seller
+    "sellar": "seller",
+    "categry":"category",
+    "catgory":"category",
+    "categroy":"category",
+    "reveiw": "review",
+    "reviwe": "review",
 }
 
 # Symbol substitutions

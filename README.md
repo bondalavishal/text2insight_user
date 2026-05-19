@@ -11,16 +11,15 @@ Built on the [Olist Brazilian E-Commerce dataset](https://www.kaggle.com/dataset
 | Feature | Description |
 |---|---|
 | **NL → SQL** | Natural language questions translated to SQL via LLM fallback chain |
+| **One-shot delivery** | Every query auto-delivers: summary + CSV file + chart + detailed analysis — no follow-up commands needed |
 | **Multi-question** | Ask up to 5 questions at once — answered in parallel with individual progress bars |
-| **Semantic cache** | Instant replies for similar questions (ChromaDB, cosine ≥ 0.78) |
+| **Semantic cache** | Instant replies for similar questions (ChromaDB, cosine ≥ 0.78); missing deliverables auto-regenerated on cache hit |
 | **Self-learning** | Every successful Q+SQL pair saved to a RAG query library for future few-shot examples |
 | **Spellcheck** | Offline typo correction + 135 abbreviation expansions (YoY, GMV, TAT, NPS, etc.) |
 | **Anomaly detection** | Auto-flags delivery > 20 days, cancellation > 5%, revenue drop > 10%, review < 3.0 |
-| **Download** | Reply `download` to get full results as a CSV file |
-| **Explain** | Reply `explain` for a structured business analyst deep-dive with key findings, outliers, business implications, and recommended actions |
-| **Feedback loop** | Thumbs up/down signals evict bad answers from cache and retrain |
+| **LLM chart gen** | LLM writes Python chart code (matplotlib / seaborn / plotly) executed at runtime for fully adaptive visualisations |
 | **Stats** | Reply `text2insight stats` for bot performance metrics |
-| **Full interaction logging** | Every interaction (query, download, explain, feedback, greeting) logged to Databricks |
+| **Full interaction logging** | Every interaction logged to Databricks with IST timestamps |
 | **Guardrails** | Blocks destructive SQL keywords, restricts to allowed data sources, enforces LIMIT |
 
 ---
@@ -32,22 +31,25 @@ Slack message
     │
     ├─ Spellcheck + abbreviation expansion (offline)
     ├─ Intent classification (regex fast-path → Cerebras slow-path)
-    ├─ Download / Explain / Stats / Feedback handlers (bypass SQL pipeline)
+    ├─ Stats handler (bypass SQL pipeline)
     │
     └─ SQL pipeline:
          ├─ Semantic cache lookup (ChromaDB) → instant reply if hit
+         │    └─ Backfill: regenerate any missing CSV / chart / explain on cache hit
          ├─ RAG retrieval (few-shot examples from query library)
          ├─ SQL generation (Cerebras → Groq → OpenRouter → Ollama)
          ├─ SQL guardrails (validate + enforce LIMIT)
          ├─ Databricks execution
          ├─ Anomaly detection
-         ├─ Plain-English summarisation (same LLM chain)
+         ├─ Combined summary + analysis (single LLM call at 90%)
+         ├─ CSV generation
+         ├─ LLM chart code generation → exec() → PNG
          ├─ Cache + query library update
-         └─ Interaction log → Databricks
+         └─ Interaction log → Databricks (IST timestamp)
 ```
 
-**LLM fallback chain** (used for SQL generation, summaries, and explanations):
-`Cerebras (15s timeout)` → `Groq (7 models, rotate on 429)` → `OpenRouter (26 models, rotate on 429)` → `Ollama (last resort)`
+**LLM fallback chain** (used for SQL generation, summaries, analysis, and chart code):
+`Cerebras (15s timeout)` → `Groq (7 models, rotate on 429/413)` → `OpenRouter (26 models, rotate on 429/413)` → `Ollama (last resort)`
 
 ---
 
@@ -59,6 +61,7 @@ Slack message
 - **ChromaDB** — semantic cache (`text2insight_cache`) and query library (`text2insight_query_lib`)
 - **sentence-transformers / ONNX MiniLM-L6-v2** — local embeddings (no external API needed)
 - **Cerebras / Groq / OpenRouter** — LLM providers in fallback chain
+- **matplotlib / seaborn / plotly + kaleido** — chart rendering (LLM picks the best library per query)
 - **pyspellchecker** — offline spellcheck
 - **Flask** — health check endpoint (`/health`)
 - **Docker + docker-compose** — containerised deployment
@@ -89,12 +92,13 @@ text2insight_user/
 │   │   └── business_logic.md        # Business rules reference
 │   │
 │   ├── slack/
-│   │   └── handler.py               # summarise_results, detect_anomalies, generate_explanation,
-│   │                                #   is_download_request, is_explain_request, get_stats
+│   │   ├── handler.py               # summarise_and_explain, detect_anomalies, generate_explanation,
+│   │   │                            #   results_to_csv_string, is_download_request, get_stats
+│   │   └── chart_generator.py       # LLM code-gen charts + seaborn/plotly spec fallback
 │   │
 │   ├── eval/
 │   │   ├── cache.py                 # ChromaDB semantic cache with number-matching guard
-│   │   └── interaction_logger.py    # Databricks interaction log writer
+│   │   └── interaction_logger.py    # Databricks interaction log writer (IST timestamps)
 │   │
 │   └── sql/
 │       ├── connector.py             # run_query() — Databricks connection
@@ -220,17 +224,21 @@ What were the top 10 categories by revenue in 2018?
 3. What's the cancellation rate by payment type?
 ```
 
-**Follow-up commands:**
+Every query automatically delivers:
+- A plain-English **summary** in the thread
+- A **CSV file** of the full result set
+- A **chart** (LLM-generated, best library chosen per query)
+- A structured **business analysis** with key findings, outliers, implications, and recommended actions
+
+**Stats:**
 ```
-download              → receive results as a CSV file
-explain               → structured business analyst breakdown of the last result
 text2insight stats    → bot performance metrics
 ```
 
-**Feedback:**
+**Feedback** (text only — no emoji reactions):
 ```
-👍  or  "looks good"   → marks the answer as correct
-👎  or  "wrong"        → evicts the answer from cache, prompts a fresh query
+"looks good"   → marks the answer as correct
+"wrong"        → evicts the answer from cache, prompts a fresh query
 ```
 
 ---
@@ -254,11 +262,11 @@ The 5 canonical test questions cover: seller quartile analysis, state revenue/TA
 
 ## Interaction Log
 
-Every interaction is logged to `default.text2insight_user_query_log` in Databricks.
+Every interaction is logged to `default.text2insight_user_query_log` in Databricks (timestamps stored in IST).
 
-**Interaction types tracked:** `data_query`, `download`, `explain`, `feedback_positive`, `feedback_negative`, `greeting`, `out_of_scope`, `stats`
+**Interaction types tracked:** `data_query`, `feedback_positive`, `feedback_negative`, `greeting`, `out_of_scope`, `stats`
 
-**Key fields:** `log_id`, `ts`, `user_id`, `email_id`, `status`, `interaction_type`, `question_asked`, `question_answered`, `generated_sql`, `result_json`, `generated_csv`, `latency_ms`, `rows_returned`, `anomaly_count`, `cached`, `similarity_score`, `success_signal`, `self_learned`, `embedding_id`
+**Key fields:** `log_id`, `ts` (IST), `user_id`, `email_id`, `status`, `interaction_type`, `question_asked`, `question_answered`, `generated_sql`, `result_json`, `generated_csv`, `viz_spec_json`, `explain_text`, `latency_ms`, `rows_returned`, `anomaly_count`, `cached`, `similarity_score`, `success_signal`, `self_learned`, `embedding_id`
 
 ---
 
@@ -268,3 +276,4 @@ Every interaction is logged to `default.text2insight_user_query_log` in Databric
 - **Connection per query** — `connector.py` opens a new Databricks connection for every `run_query()` call. Under high concurrency (5 parallel questions × multiple calls each) this can hit warehouse connection limits.
 - **Local/Databricks log drift** — `app/eval/eval_log.csv` and the Databricks table are written independently. Running `run_test.py` wipes the local CSV but not all Databricks rows, causing permanent gaps in log IDs.
 - **No time dimension on seller/product views** — `vw_seller_metrics` and `vw_product_metrics` are lifetime aggregates. Trend questions about individual sellers or products require raw table queries.
+- **Chart code-gen latency** — LLM chart generation adds ~5–15s per query (depending on which provider responds). On cache hits, the faster spec-based renderer is used instead.

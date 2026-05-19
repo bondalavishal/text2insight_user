@@ -89,7 +89,7 @@ def log_interaction(
         latency_ms, rows_returned, anomaly_count, cached,
         embedding_id, viz_spec_json, explain_text
     ) VALUES (
-        CURRENT_TIMESTAMP(),
+        from_utc_timestamp(CURRENT_TIMESTAMP(), 'Asia/Kolkata'),
         {sql_str(user_id)},
         {sql_str(email_id)},
         {sql_str(full_name)},

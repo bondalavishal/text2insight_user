@@ -53,9 +53,9 @@ def validate_sql(sql: str) -> tuple[bool, str, str]:
     return True, "OK", "ok"
 
 
-def enforce_limit(sql: str, max_limit: int = 100) -> str:
+def enforce_limit(sql: str, max_limit: int = 500) -> str:
     if "LIMIT" not in sql.upper():
-        sql = sql.rstrip() + "\nLIMIT 100"
+        sql = sql.rstrip() + "\nLIMIT 500"
     else:
         match = re.search(r'LIMIT\s+(\d+)', sql, re.IGNORECASE)
         if match and int(match.group(1)) > max_limit:

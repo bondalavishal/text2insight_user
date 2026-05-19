@@ -576,3 +576,513 @@ FROM risk_scores
 ORDER BY risk_score DESC
 LIMIT 20;
 ```
+
+---
+
+## Advanced SQL Patterns
+
+### Timestamp rules for raw tables:
+```
+-- YEAR() / MONTH() work on TIMESTAMP and DATE in Databricks
+-- DATE_FORMAT(ts, 'yyyy-MM') produces year_month strings e.g. '2017-01'
+-- olist_orders.order_purchase_timestamp is TIMESTAMP — use DATE_FORMAT for year_month grouping
+-- NEVER use order_date on raw tables — only vw_orders_metrics has order_date (pre-cast DATE)
+-- For delivery days on raw tables: DATEDIFF(order_delivered_customer_date, order_purchase_timestamp)
+-- Always filter WHERE order_delivered_customer_date IS NOT NULL when computing delivery days on raw tables
+```
+
+### Payment deduplication rule:
+```
+-- olist_order_payments has one row per payment method per order
+-- Orders paid with multiple methods (e.g. voucher + credit card) produce multiple rows
+-- Filter WHERE payment_sequential = 1 to get the primary payment method only
+-- Use SUM(payment_value) across all payment_sequential values for the true order total
+-- NEVER COUNT(order_id) on olist_order_payments without deduplication — it inflates counts
+```
+
+### Category + time revenue (foundation for waterfall, stacked area, bump chart, heatmap):
+```sql
+-- Rule: NO view covers category + time together — always use raw tables for this pattern
+-- Rule: filter NOT IN ('canceled','unavailable') to match revenue semantics of the views
+-- Rule: use LIMIT 500 for multi-category × multi-month queries (10 categories × 24 months = 240 rows)
+SELECT
+    t.product_category_name_english AS category,
+    YEAR(o.order_purchase_timestamp)                        AS year,
+    MONTH(o.order_purchase_timestamp)                       AS month,
+    DATE_FORMAT(o.order_purchase_timestamp, 'yyyy-MM')      AS year_month,
+    COUNT(DISTINCT o.order_id)                              AS total_orders,
+    ROUND(SUM(i.price), 2)                                  AS total_revenue
+FROM olist_orders o
+JOIN olist_order_items i          ON o.order_id   = i.order_id
+JOIN olist_products p             ON i.product_id = p.product_id
+JOIN product_category_translation t ON p.product_category_name = t.product_category_name
+WHERE o.order_status NOT IN ('canceled', 'unavailable')
+GROUP BY t.product_category_name_english,
+         YEAR(o.order_purchase_timestamp),
+         MONTH(o.order_purchase_timestamp),
+         DATE_FORMAT(o.order_purchase_timestamp, 'yyyy-MM')
+ORDER BY year, month, total_revenue DESC
+LIMIT 500;
+```
+
+### Waterfall: category revenue change between two years (2017 vs 2018):
+```sql
+-- Rule: FULL OUTER JOIN the two year CTEs — categories may appear in one year but not the other
+-- Rule: ORDER BY ABS(delta) DESC to surface biggest movers at the top
+-- Rule: delta can be negative (shrinking categories) — essential for waterfall chart
+WITH cat_2017 AS (
+    SELECT t.product_category_name_english AS category,
+           ROUND(SUM(i.price), 2) AS revenue_2017
+    FROM olist_orders o
+    JOIN olist_order_items i          ON o.order_id   = i.order_id
+    JOIN olist_products p             ON i.product_id = p.product_id
+    JOIN product_category_translation t ON p.product_category_name = t.product_category_name
+    WHERE YEAR(o.order_purchase_timestamp) = 2017
+      AND o.order_status NOT IN ('canceled', 'unavailable')
+    GROUP BY t.product_category_name_english
+),
+cat_2018 AS (
+    SELECT t.product_category_name_english AS category,
+           ROUND(SUM(i.price), 2) AS revenue_2018
+    FROM olist_orders o
+    JOIN olist_order_items i          ON o.order_id   = i.order_id
+    JOIN olist_products p             ON i.product_id = p.product_id
+    JOIN product_category_translation t ON p.product_category_name = t.product_category_name
+    WHERE YEAR(o.order_purchase_timestamp) = 2018
+      AND o.order_status NOT IN ('canceled', 'unavailable')
+    GROUP BY t.product_category_name_english
+)
+SELECT
+    COALESCE(a.category, b.category)        AS category,
+    COALESCE(a.revenue_2017, 0)             AS revenue_2017,
+    COALESCE(b.revenue_2018, 0)             AS revenue_2018,
+    ROUND(COALESCE(b.revenue_2018, 0) - COALESCE(a.revenue_2017, 0), 2) AS delta
+FROM cat_2017 a
+FULL OUTER JOIN cat_2018 b ON a.category = b.category
+ORDER BY ABS(COALESCE(b.revenue_2018, 0) - COALESCE(a.revenue_2017, 0)) DESC
+LIMIT 20;
+```
+
+### Customer state → seller state flow (Sankey / flow analysis):
+```sql
+-- Rule: olist_orders has NO seller_id and NO customer_state — need all 4 tables
+-- Rule: olist_orders has NO customer_state → join olist_customers for customer_state
+-- Rule: seller_state comes from olist_sellers, reached via olist_order_items.seller_id
+-- Rule: COUNT(DISTINCT o.order_id) — the join produces one row per order-item pair
+-- Rule: use CTEs to pre-filter top-N states before joining — avoids full cross-product
+-- Rule: filter top customer states and top seller states separately, then join
+WITH top_customer_states AS (
+    SELECT c.customer_state
+    FROM olist_orders o
+    JOIN olist_customers c ON o.customer_id = c.customer_id
+    GROUP BY c.customer_state
+    ORDER BY COUNT(DISTINCT o.order_id) DESC
+    LIMIT 8
+),
+top_seller_states AS (
+    SELECT s.seller_state
+    FROM olist_order_items i
+    JOIN olist_sellers s ON i.seller_id = s.seller_id
+    GROUP BY s.seller_state
+    ORDER BY COUNT(DISTINCT i.order_id) DESC
+    LIMIT 8
+)
+SELECT
+    c.customer_state,
+    s.seller_state,
+    COUNT(DISTINCT o.order_id)  AS order_count,
+    ROUND(SUM(i.price), 2)      AS total_revenue
+FROM olist_orders o
+JOIN olist_customers c   ON o.customer_id = c.customer_id
+JOIN olist_order_items i ON o.order_id    = i.order_id
+JOIN olist_sellers s     ON i.seller_id   = s.seller_id
+WHERE o.order_status = 'delivered'
+  AND c.customer_state IN (SELECT customer_state FROM top_customer_states)
+  AND s.seller_state   IN (SELECT seller_state   FROM top_seller_states)
+GROUP BY c.customer_state, s.seller_state
+ORDER BY order_count DESC
+LIMIT 100;
+```
+
+### Category rank over time — bump chart (rank shifts month by month):
+```sql
+-- Rule: use RANK() PARTITION BY year_month — gives rank within each month independently
+-- Rule: top_categories CTE limits to top N by total GMV so chart stays readable
+-- Rule: LIMIT 500 — 10 categories × ~24 months = ~240 rows needed
+WITH monthly_cat AS (
+    SELECT
+        t.product_category_name_english                     AS category,
+        DATE_FORMAT(o.order_purchase_timestamp, 'yyyy-MM')  AS year_month,
+        ROUND(SUM(i.price), 2)                              AS monthly_revenue
+    FROM olist_orders o
+    JOIN olist_order_items i          ON o.order_id   = i.order_id
+    JOIN olist_products p             ON i.product_id = p.product_id
+    JOIN product_category_translation t ON p.product_category_name = t.product_category_name
+    WHERE o.order_status NOT IN ('canceled', 'unavailable')
+    GROUP BY t.product_category_name_english,
+             DATE_FORMAT(o.order_purchase_timestamp, 'yyyy-MM')
+),
+top_cats AS (
+    SELECT category
+    FROM monthly_cat
+    GROUP BY category
+    ORDER BY SUM(monthly_revenue) DESC
+    LIMIT 10
+),
+ranked AS (
+    SELECT m.category, m.year_month, m.monthly_revenue,
+           RANK() OVER (PARTITION BY m.year_month ORDER BY m.monthly_revenue DESC) AS revenue_rank
+    FROM monthly_cat m
+    WHERE m.category IN (SELECT category FROM top_cats)
+)
+SELECT category, year_month, monthly_revenue, revenue_rank
+FROM ranked
+ORDER BY year_month, revenue_rank
+LIMIT 500;
+```
+
+### Delivery days distribution by category — individual rows for violin / box plot:
+```sql
+-- Rule: vw_orders_metrics has delivery_days (pre-computed); join to raw tables for category
+-- Rule: use LIMIT 500 — individual rows needed for distribution charts, not aggregates
+-- Rule: top 10 categories by order volume filtered via subquery to keep chart readable
+WITH top_cats AS (
+    SELECT category FROM vw_product_metrics
+    ORDER BY total_orders DESC LIMIT 10
+)
+SELECT
+    t.product_category_name_english AS category,
+    m.delivery_days
+FROM vw_orders_metrics m
+JOIN olist_order_items i          ON m.order_id   = i.order_id
+JOIN olist_products p             ON i.product_id = p.product_id
+JOIN product_category_translation t ON p.product_category_name = t.product_category_name
+WHERE m.delivery_days IS NOT NULL
+  AND m.order_status = 'delivered'
+  AND t.product_category_name_english IN (SELECT category FROM top_cats)
+ORDER BY category
+LIMIT 500;
+```
+
+### Payment type mix by year — stacked bar (% share per year):
+```sql
+-- Rule: payment_sequential = 1 → primary payment method only, avoids double-counting
+-- Rule: window SUM() OVER (PARTITION BY year) gives yearly total for % calculation
+-- Rule: YEAR(order_purchase_timestamp) on raw olist_orders for the year dimension
+WITH payment_year AS (
+    SELECT
+        YEAR(o.order_purchase_timestamp)    AS year,
+        op.payment_type,
+        COUNT(DISTINCT o.order_id)          AS order_count,
+        ROUND(SUM(op.payment_value), 2)     AS total_value
+    FROM olist_orders o
+    JOIN olist_order_payments op ON o.order_id = op.order_id
+    WHERE op.payment_sequential = 1
+      AND o.order_status NOT IN ('canceled', 'unavailable')
+    GROUP BY YEAR(o.order_purchase_timestamp), op.payment_type
+)
+SELECT
+    year,
+    payment_type,
+    order_count,
+    total_value,
+    ROUND(order_count * 100.0 / SUM(order_count) OVER (PARTITION BY year), 2) AS pct_of_year
+FROM payment_year
+ORDER BY year, order_count DESC
+LIMIT 50;
+```
+
+### Customer state × payment type — heatmap matrix:
+```sql
+-- Rule: olist_order_payments has NO customer_id — join via olist_orders, then olist_customers
+-- Rule: payment_sequential = 1 to count each order once under its primary payment method
+SELECT
+    c.customer_state,
+    op.payment_type,
+    COUNT(DISTINCT o.order_id)      AS order_count,
+    ROUND(SUM(op.payment_value), 2) AS total_value
+FROM olist_orders o
+JOIN olist_customers c          ON o.customer_id = c.customer_id
+JOIN olist_order_payments op    ON o.order_id    = op.order_id
+WHERE op.payment_sequential = 1
+  AND o.order_status NOT IN ('canceled', 'unavailable')
+GROUP BY c.customer_state, op.payment_type
+ORDER BY order_count DESC
+LIMIT 200;
+```
+
+### Payment installments distribution by category — violin / heatmap:
+```sql
+-- Rule: installment analysis needs olist_order_payments + olist_orders + items + products + translation
+-- Rule: filter payment_type = 'credit_card' — installments only meaningful for credit
+-- Rule: LIMIT 500 for individual-row distribution charts
+SELECT
+    t.product_category_name_english AS category,
+    op.payment_installments,
+    COUNT(DISTINCT o.order_id)      AS order_count
+FROM olist_orders o
+JOIN olist_order_payments op      ON o.order_id   = op.order_id
+JOIN olist_order_items i          ON o.order_id   = i.order_id
+JOIN olist_products p             ON i.product_id = p.product_id
+JOIN product_category_translation t ON p.product_category_name = t.product_category_name
+WHERE op.payment_type = 'credit_card'
+  AND o.order_status NOT IN ('canceled', 'unavailable')
+GROUP BY t.product_category_name_english, op.payment_installments
+ORDER BY category, payment_installments
+LIMIT 500;
+```
+
+### Multi-metric per category — correlation / bubble / scatter matrix:
+```sql
+-- Rule: four separate CTEs, each responsible for ONE metric dimension
+-- Rule: JOIN all CTEs on category — only categories appearing in all dimensions are included
+-- Rule: HAVING total_orders >= 50 removes noisy low-volume categories
+-- Produces: category × (revenue, orders, avg_price, freight_pct, delivery_days, review, cancel_rate)
+WITH cat_base AS (
+    SELECT
+        t.product_category_name_english                                         AS category,
+        COUNT(DISTINCT o.order_id)                                              AS total_orders,
+        ROUND(SUM(i.price), 2)                                                  AS total_revenue,
+        ROUND(AVG(i.price), 2)                                                  AS avg_price,
+        ROUND(AVG(i.freight_value / NULLIF(i.price, 0)) * 100, 2)              AS freight_pct,
+        ROUND(COUNT(DISTINCT CASE WHEN o.order_status = 'canceled'
+              THEN o.order_id END) * 100.0 / NULLIF(COUNT(DISTINCT o.order_id), 0), 2) AS cancel_rate
+    FROM olist_orders o
+    JOIN olist_order_items i          ON o.order_id   = i.order_id
+    JOIN olist_products p             ON i.product_id = p.product_id
+    JOIN product_category_translation t ON p.product_category_name = t.product_category_name
+    GROUP BY t.product_category_name_english
+    HAVING COUNT(DISTINCT o.order_id) >= 50
+),
+cat_delivery AS (
+    SELECT
+        t.product_category_name_english AS category,
+        ROUND(AVG(m.delivery_days), 1)  AS avg_delivery_days
+    FROM vw_orders_metrics m
+    JOIN olist_order_items i          ON m.order_id   = i.order_id
+    JOIN olist_products p             ON i.product_id = p.product_id
+    JOIN product_category_translation t ON p.product_category_name = t.product_category_name
+    WHERE m.delivery_days IS NOT NULL AND m.order_status = 'delivered'
+    GROUP BY t.product_category_name_english
+),
+cat_reviews AS (
+    SELECT
+        t.product_category_name_english AS category,
+        ROUND(AVG(r.review_score), 3)   AS avg_review_score
+    FROM olist_order_items i
+    JOIN olist_products p             ON i.product_id = p.product_id
+    JOIN product_category_translation t ON p.product_category_name = t.product_category_name
+    JOIN olist_order_reviews r        ON i.order_id   = r.order_id
+    GROUP BY t.product_category_name_english
+)
+SELECT
+    b.category, b.total_orders, b.total_revenue, b.avg_price,
+    b.freight_pct, b.cancel_rate,
+    d.avg_delivery_days,
+    r.avg_review_score
+FROM cat_base b
+JOIN cat_delivery d ON b.category = d.category
+JOIN cat_reviews  r ON b.category = r.category
+ORDER BY b.total_revenue DESC
+LIMIT 100;
+```
+
+### State bubble chart — revenue + delivery + review per state:
+```sql
+-- Rule: three dimensions per state for bubble chart (size=revenue, x=delivery, y=review)
+-- Rule: state review joins via vw_orders_metrics (has order_id + customer_state) → olist_order_reviews
+-- Rule: CROSS JOIN platform_avg to include benchmark lines in the output
+WITH state_metrics AS (
+    SELECT
+        m.customer_state,
+        ROUND(SUM(m.order_revenue), 2)  AS total_revenue,
+        ROUND(AVG(m.delivery_days), 1)  AS avg_delivery_days,
+        COUNT(DISTINCT m.order_id)      AS total_orders
+    FROM vw_orders_metrics m
+    WHERE m.delivery_days IS NOT NULL
+    GROUP BY m.customer_state
+),
+state_reviews AS (
+    SELECT
+        m.customer_state,
+        ROUND(AVG(r.review_score), 3) AS avg_review_score
+    FROM vw_orders_metrics m
+    JOIN olist_order_reviews r ON m.order_id = r.order_id
+    GROUP BY m.customer_state
+),
+platform AS (
+    SELECT
+        ROUND(AVG(sm.avg_delivery_days), 1) AS platform_avg_delivery,
+        ROUND(AVG(sr.avg_review_score), 3)  AS platform_avg_review
+    FROM state_metrics sm
+    JOIN state_reviews sr ON sm.customer_state = sr.customer_state
+)
+SELECT
+    sm.customer_state,
+    sm.total_revenue,
+    sm.total_orders,
+    sm.avg_delivery_days,
+    sr.avg_review_score,
+    p.platform_avg_delivery,
+    p.platform_avg_review
+FROM state_metrics sm
+JOIN state_reviews  sr ON sm.customer_state = sr.customer_state
+CROSS JOIN platform p
+ORDER BY sm.total_revenue DESC
+LIMIT 50;
+```
+
+### Customer cohort retention — cohort heatmap:
+```sql
+-- Rule: use customer_unique_id (not customer_id) — customer_id is per-order
+-- Rule: cohort_month = DATE_FORMAT of the customer's FIRST order
+-- Rule: period_number = months between cohort_month and order_month (0 = acquisition month)
+-- Rule: MONTHS_BETWEEN(date2, date1) in Databricks — note argument order
+-- Rule: LIMIT 500 — cohort × period matrix can have many rows
+WITH first_orders AS (
+    SELECT
+        c.customer_unique_id,
+        DATE_FORMAT(MIN(o.order_purchase_timestamp), 'yyyy-MM') AS cohort_month
+    FROM olist_orders o
+    JOIN olist_customers c ON o.customer_id = c.customer_id
+    GROUP BY c.customer_unique_id
+),
+all_orders AS (
+    SELECT
+        c.customer_unique_id,
+        DATE_FORMAT(o.order_purchase_timestamp, 'yyyy-MM') AS order_month
+    FROM olist_orders o
+    JOIN olist_customers c ON o.customer_id = c.customer_id
+),
+cohort_activity AS (
+    SELECT
+        f.cohort_month,
+        a.order_month,
+        COUNT(DISTINCT f.customer_unique_id)   AS active_customers,
+        CAST(MONTHS_BETWEEN(
+            TO_DATE(a.order_month,  'yyyy-MM'),
+            TO_DATE(f.cohort_month, 'yyyy-MM')
+        ) AS INT)                              AS period_number
+    FROM first_orders f
+    JOIN all_orders a ON f.customer_unique_id = a.customer_unique_id
+    WHERE a.order_month >= f.cohort_month
+    GROUP BY f.cohort_month, a.order_month
+),
+cohort_sizes AS (
+    SELECT cohort_month, COUNT(DISTINCT customer_unique_id) AS cohort_size
+    FROM first_orders
+    GROUP BY cohort_month
+)
+SELECT
+    ca.cohort_month,
+    cs.cohort_size,
+    ca.period_number,
+    ca.active_customers,
+    ROUND(ca.active_customers * 100.0 / cs.cohort_size, 2) AS retention_pct
+FROM cohort_activity ca
+JOIN cohort_sizes cs ON ca.cohort_month = cs.cohort_month
+ORDER BY ca.cohort_month, ca.period_number
+LIMIT 500;
+```
+
+### RFM customer segmentation — treemap / bubble by segment:
+```sql
+-- Rule: recency reference date = '2018-09-01' (last full data month in Olist)
+-- Rule: NTILE(5) — 5 = best; for recency, ORDER BY recency_days ASC (fewer days = more recent = score 5)
+-- Rule: assign segment label in rfm_scores CTE, then GROUP BY segment label string (not repeated CASE WHEN)
+-- Rule: use customer_unique_id (not customer_id) for person-level aggregation
+WITH customer_metrics AS (
+    SELECT
+        c.customer_unique_id,
+        DATEDIFF(TO_DATE('2018-09-01'), MAX(DATE(o.order_purchase_timestamp))) AS recency_days,
+        COUNT(DISTINCT o.order_id)                                              AS frequency,
+        ROUND(SUM(i.price + i.freight_value), 2)                               AS monetary
+    FROM olist_orders o
+    JOIN olist_customers c   ON o.customer_id = c.customer_id
+    JOIN olist_order_items i ON o.order_id    = i.order_id
+    WHERE o.order_status = 'delivered'
+    GROUP BY c.customer_unique_id
+),
+rfm_scores AS (
+    SELECT *,
+        NTILE(5) OVER (ORDER BY recency_days ASC) AS r_score,
+        NTILE(5) OVER (ORDER BY frequency ASC)    AS f_score,
+        NTILE(5) OVER (ORDER BY monetary ASC)     AS m_score
+    FROM customer_metrics
+),
+rfm_labeled AS (
+    SELECT *,
+        CASE
+            WHEN r_score >= 4 AND f_score >= 4 AND m_score >= 4 THEN 'Champions'
+            WHEN r_score >= 3 AND f_score >= 3                  THEN 'Loyal'
+            WHEN r_score >= 4 AND f_score <= 2                  THEN 'New Customers'
+            WHEN r_score <= 2 AND f_score >= 3                  THEN 'At Risk'
+            WHEN r_score <= 2 AND f_score <= 2                  THEN 'Lost'
+            ELSE 'Potential Loyalists'
+        END AS rfm_segment
+    FROM rfm_scores
+)
+SELECT
+    rfm_segment,
+    COUNT(*)                    AS customer_count,
+    ROUND(AVG(recency_days), 1) AS avg_recency_days,
+    ROUND(AVG(frequency), 2)    AS avg_frequency,
+    ROUND(AVG(monetary), 2)     AS avg_monetary
+FROM rfm_labeled
+GROUP BY rfm_segment
+ORDER BY customer_count DESC
+LIMIT 20;
+```
+
+### Order value histogram — bucket distribution:
+```sql
+-- Rule: CASE WHEN bucket in GROUP BY must exactly match SELECT CASE WHEN — no aliases in GROUP BY
+-- Rule: ORDER BY MIN(order_revenue) gives natural numeric bucket order (not alphabetical)
+SELECT
+    CASE
+        WHEN order_revenue < 50   THEN '1. 0–50'
+        WHEN order_revenue < 100  THEN '2. 50–100'
+        WHEN order_revenue < 200  THEN '3. 100–200'
+        WHEN order_revenue < 500  THEN '4. 200–500'
+        WHEN order_revenue < 1000 THEN '5. 500–1000'
+        ELSE                           '6. 1000+'
+    END                            AS revenue_bucket,
+    COUNT(*)                       AS order_count,
+    ROUND(AVG(order_revenue), 2)   AS avg_order_value,
+    ROUND(MIN(order_revenue), 2)   AS bucket_min
+FROM vw_orders_metrics
+WHERE order_revenue IS NOT NULL AND order_revenue > 0
+GROUP BY
+    CASE
+        WHEN order_revenue < 50   THEN '1. 0–50'
+        WHEN order_revenue < 100  THEN '2. 50–100'
+        WHEN order_revenue < 200  THEN '3. 100–200'
+        WHEN order_revenue < 500  THEN '4. 200–500'
+        WHEN order_revenue < 1000 THEN '5. 500–1000'
+        ELSE                           '6. 1000+'
+    END
+ORDER BY bucket_min
+LIMIT 10;
+```
+
+### Seller region × customer region delivery heatmap:
+```sql
+-- Rule: 4-table join — seller_state via olist_sellers (reached through olist_order_items)
+-- Rule: customer_state via olist_customers (reached through olist_orders.customer_id)
+-- Rule: delivery_days from vw_orders_metrics (has order_id + delivery_days pre-computed)
+SELECT
+    c.customer_state,
+    s.seller_state,
+    ROUND(AVG(m.delivery_days), 1)  AS avg_delivery_days,
+    COUNT(DISTINCT m.order_id)      AS order_count
+FROM vw_orders_metrics m
+JOIN olist_order_items i  ON m.order_id   = i.order_id
+JOIN olist_sellers s      ON i.seller_id  = s.seller_id
+JOIN olist_customers c    ON m.customer_id = c.customer_id
+WHERE m.delivery_days IS NOT NULL
+  AND m.order_status = 'delivered'
+GROUP BY c.customer_state, s.seller_state
+HAVING COUNT(DISTINCT m.order_id) >= 20
+ORDER BY avg_delivery_days DESC
+LIMIT 200;
+```
